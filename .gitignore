@@ -1,0 +1,23 @@
+# Dependencies / local tooling (not part of the public product)
+node_modules/
+package.json
+package-lock.json
+
+# Local tests & one-off debug helpers
+test-*.mjs
+inspect-*.mjs
+find-*.py
+read-*.py
+scan-*.py
+_*.py
+publish-greasyfork.mjs
+
+# Secrets / session / machine-local
+.greasyfork-storage.json
+greasyfork-publish*.png
+*.log
+.DS_Store
+Thumbs.db
+
+# Optional local agent notes (keep machine-local if desired)
+# AGENTS.md is public-safe in this repo; do not put secrets there.

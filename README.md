@@ -22,6 +22,8 @@ YouTube **embeds** often fail bot/human checks — especially with privacy addon
 
 Also best-effort: rewrite `youtube-nocookie.com` → `www.youtube.com` on the embed URL.
 
+Supports live iframes and **lazy facades** that only inject an iframe on click (CMS `data-iframe` JSON, YouTube thumbnail posters, `lite-youtube`, etc.).
+
 ### Overlay
 
 - **Watch on YouTube** — open the watch page in a new tab  

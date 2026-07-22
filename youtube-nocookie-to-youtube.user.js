@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.2.0
+// @version      5.3.0
 // @description  On any site: when a YouTube embed won’t play, show Watch on YouTube. Prefers player API signals; falls back to a local timer if those are blocked.
 // @author       ollebro
 // @license      MIT
@@ -26,14 +26,14 @@
   const OVERLAY_CLASS = 'yt-embed-center-overlay';
   const STYLE_ID = 'yt-embed-overlay-style';
 
-  // Works on any page (global @match). Site-specific selectors are only helpers;
-  // the universal path is any YouTube iframe / lite-youtube / open-shadow embed.
+  // Works on any page (global @match). Universal paths:
+  //   live iframes, lite-youtube, lazy CMS facades (data-iframe JSON, ytimg thumbs),
+  //   open-shadow hosts. Site-specific class names are helpers only.
   //
   // Detection layers (best then fallback):
   // 1) IFrame API via enablejsapi + postMessage (play / onError) when available
   // 2) Local timer after user interaction if API messages never arrive
-  //    (common with privacy addons/settings that also break embed bot-checks)
-  // Escape hatch is always a first-party youtube.com/watch link — not fixing the embed.
+  // Escape hatch is always a first-party youtube.com/watch link.
   /** Fallback timer after the user tries to play (not on passive load). */
   const BLOCKED_DELAY_MS = 2000;
   const MIN_PLAYBACK_SECONDS = 0.3;
@@ -70,6 +70,12 @@
     '[data-youtube-id]',
     '[data-video-id][data-provider="youtube"]',
   ].join(', ');
+
+  /** Config JSON on the element (e.g. Adobe AEM cmp-embed data-iframe). */
+  const DATA_IFRAME_SELECTOR = '[data-iframe]';
+  /** YouTube poster thumbnails used as click-to-load facades. */
+  const YTIMG_SELECTOR =
+    'img[src*="i.ytimg.com/vi/"], img[src*="img.youtube.com/vi/"], source[srcset*="i.ytimg.com/vi/"]';
 
   /** Cheap known open-shadow hosts; full scans also discover other custom elements. */
   const SHADOW_HOST_SELECTOR = 'shreddit-embed';
@@ -176,6 +182,188 @@
       if (match) return match[1];
     }
     return null;
+  }
+
+  function isVideoId(id) {
+    return typeof id === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(id);
+  }
+
+  /** Parse CMS JSON blobs (data-iframe, data-layer) for a YouTube video id. */
+  function videoIdFromConfigObject(obj, depth = 0) {
+    if (!obj || depth > 6) return null;
+    if (typeof obj === 'string') return extractId(obj) || (isVideoId(obj) ? obj : null);
+    if (typeof obj !== 'object') return null;
+
+    const directKeys = [
+      'youtubeCepVideoId',
+      'youtubeVideoId',
+      'videoId',
+      'videoid',
+      'youtubeId',
+      'ytId',
+      'id',
+    ];
+    for (const key of directKeys) {
+      const v = obj[key];
+      if (isVideoId(v)) return v;
+      if (typeof v === 'string') {
+        const fromStr = extractId(v);
+        if (fromStr) return fromStr;
+      }
+    }
+
+    if (typeof obj.src === 'string' && /youtube/i.test(obj.src)) {
+      const id = extractId(obj.src);
+      if (id) return id;
+    }
+    if (obj.type && String(obj.type).toLowerCase() === 'youtube' && typeof obj.src === 'string') {
+      const id = extractId(obj.src);
+      if (id) return id;
+    }
+
+    if (obj.embeddableProperties) {
+      const nested = videoIdFromConfigObject(obj.embeddableProperties, depth + 1);
+      if (nested) return nested;
+    }
+
+    for (const v of Object.values(obj)) {
+      if (v && typeof v === 'object') {
+        const nested = videoIdFromConfigObject(v, depth + 1);
+        if (nested) return nested;
+      } else if (typeof v === 'string' && /youtube|youtu\.be|ytimg/i.test(v)) {
+        const id = extractId(v);
+        if (id) return id;
+      }
+    }
+    return null;
+  }
+
+  function parseJsonAttr(el, name) {
+    const raw = el.getAttribute?.(name);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // HTML-entity-encoded quotes sometimes appear in static markup
+      try {
+        const decoded = raw
+          .replace(/&quot;/g, '"')
+          .replace(/&#34;/g, '"')
+          .replace(/&amp;/g, '&');
+        return JSON.parse(decoded);
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  function videoIdFromElementConfig(el) {
+    if (!(el instanceof Element)) return null;
+
+    const fromIframeAttr = videoIdFromConfigObject(parseJsonAttr(el, 'data-iframe'));
+    if (fromIframeAttr) return fromIframeAttr;
+
+    const fromLayer = videoIdFromConfigObject(parseJsonAttr(el, 'data-cmp-data-layer'));
+    if (fromLayer) return fromLayer;
+
+    for (const name of ['data-video-id', 'data-youtube-id', 'data-videoid', 'videoid']) {
+      const v = el.getAttribute(name);
+      if (isVideoId(v)) return v;
+      const from = extractId(v || '');
+      if (from) return from;
+    }
+
+    return extractId(el.getAttribute('data-iframe') || '') || null;
+  }
+
+  /**
+   * Wire a lazy facade (thumbnail / config, iframe created later or never).
+   * Click starts the blocked timer even if no iframe appears.
+   */
+  function attachFacadeMount(mount, videoId) {
+    if (!isValidMount(mount) || !isVideoId(videoId)) return;
+
+    const state = getOrCreateState(mount, videoId);
+    if (!state) return;
+
+    if (!mount.hasAttribute(CLICK_MARKER)) {
+      mount.setAttribute(CLICK_MARKER, '1');
+      mount.addEventListener(
+        'click',
+        () => {
+          primeBlockedCheck(mount, videoId);
+          waitForIframe(mount);
+          // Some CMS inject the iframe on the wrapper, not the facade node.
+          const wrap = mount.closest('.cmp-embed, .embed, [class*="embed"]') || mount.parentElement;
+          if (wrap && wrap !== mount) waitForIframe(wrap);
+        },
+        true
+      );
+    }
+
+    const iframe = findYoutubeIframe(mount) || findYoutubeIframe(mount.parentElement);
+    if (iframe) attachIframe(iframe);
+  }
+
+  /** Adobe AEM / generic: data-iframe JSON with type youtube + src. */
+  function attachDataIframeEmbed(el) {
+    if (!(el instanceof Element)) return;
+    const cfg = parseJsonAttr(el, 'data-iframe');
+    if (!cfg) {
+      // Attribute contains youtube but is not JSON — try extractId
+      const raw = el.getAttribute('data-iframe') || '';
+      if (!/youtube/i.test(raw)) return;
+      const id = extractId(raw);
+      if (id) attachFacadeMount(el, id);
+      return;
+    }
+
+    const type = String(cfg.type || '').toLowerCase();
+    const src = String(cfg.src || cfg.url || '');
+    if (type && type !== 'youtube' && !/youtube/i.test(src)) return;
+    if (!type && !/youtube/i.test(src)) return;
+
+    const videoId = videoIdFromConfigObject(cfg) || extractId(src);
+    if (!videoId) return;
+    attachFacadeMount(el, videoId);
+  }
+
+  /** Click-to-load posters (i.ytimg.com/vi/ID/...) inside embed-like containers. */
+  function attachYtimgFacade(node) {
+    if (!(node instanceof Element)) return;
+    const ref =
+      node.getAttribute('src') ||
+      node.getAttribute('srcset') ||
+      '';
+    const videoId = extractId(ref);
+    if (!videoId) return;
+
+    const mount =
+      node.closest(DATA_IFRAME_SELECTOR) ||
+      node.closest(
+        [
+          '.cmp-embed__youtube',
+          '.cmp-embed',
+          '.wp-block-embed-youtube',
+          '.youtube-player',
+          '[class*="youtube"]',
+          '[class*="Youtube"]',
+        ].join(', ')
+      ) ||
+      node.closest('picture')?.parentElement ||
+      null;
+
+    if (!mount || !isValidMount(mount)) return;
+    // Avoid wiring random ytimg icons/avatars without embed context.
+    if (
+      !mount.hasAttribute('data-iframe') &&
+      !/embed|youtube|player|video/i.test(mount.className || '') &&
+      !mount.closest('.cmp-embed, .embed, [class*="youtube"]')
+    ) {
+      return;
+    }
+
+    attachFacadeMount(mount, videoIdFromElementConfig(mount) || videoId);
   }
 
   function iframeSrc(iframe) {
@@ -486,6 +674,9 @@
 
     return (
       iframe.closest('lite-youtube') ||
+      iframe.closest('[data-iframe]') ||
+      iframe.closest('.cmp-embed__youtube') ||
+      iframe.closest('.cmp-embed') ||
       iframe.closest('f-embed-youtube') ||
       iframe.closest('f-embed[data-type="youtube"]') ||
       iframe.closest('[data-type="youtube"]') ||
@@ -788,6 +979,9 @@
     );
     root.querySelectorAll(LITE_SELECTOR).forEach((el) => safeCall(attachLiteElement, el));
     root.querySelectorAll(LAZY_EMBED_SELECTOR).forEach((el) => safeCall(attachLazyEmbed, el));
+    // Lazy facades: config JSON / CMS thumbs before an iframe exists (AEM, etc.).
+    root.querySelectorAll(DATA_IFRAME_SELECTOR).forEach((el) => safeCall(attachDataIframeEmbed, el));
+    root.querySelectorAll(YTIMG_SELECTOR).forEach((el) => safeCall(attachYtimgFacade, el));
     root.querySelectorAll(SHADOW_HOST_SELECTOR).forEach((el) => safeCall(watchShadowHost, el));
 
     // Open shadow is invisible to normal querySelectorAll from outside.

@@ -5,12 +5,14 @@ package-lock.json
 
 # Local tests & one-off debug helpers
 test-*.mjs
+debug-*.mjs
 inspect-*.mjs
 find-*.py
 read-*.py
 scan-*.py
 _*.py
 publish-greasyfork.mjs
+
 
 # Secrets / session / machine-local
 .greasyfork-storage.json

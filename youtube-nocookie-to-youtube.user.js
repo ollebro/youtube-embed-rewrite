@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.4.1
-// @description  On any site: when a YouTube embed won’t play, show Watch on YouTube. Prefers player API signals; falls back to a local timer if those are blocked.
+// @version      5.5.0
+// @description  On any site: when a YouTube embed won’t play after you try it, show Watch on YouTube on the player only.
 // @author       ollebro
 // @license      MIT
 // @match        *://*/*
@@ -32,10 +32,15 @@
   //
   // Detection layers (best then fallback):
   // 1) IFrame API via enablejsapi + postMessage (play / onError) when available
-  // 2) Local timer after user interaction if API messages never arrive
+  // 2) Local timer ONLY after a real user gesture on the player (never auto)
   // Escape hatch is always a first-party youtube.com/watch link.
+  // Overlay always mounts on a tight player shell — never full-page wrappers.
   /** Fallback timer after the user tries to play (not on passive load). */
   const BLOCKED_DELAY_MS = 2000;
+  const DEFAULT_SHELL_W = 640;
+  const DEFAULT_SHELL_H = 360;
+  const MAX_SHELL_W = 960;
+  const MAX_SHELL_H = 540;
   const MIN_PLAYBACK_SECONDS = 0.3;
   const WAIT_IFRAME_MS = 15000;
   const SCAN_DEBOUNCE_MS = 80;
@@ -294,15 +299,49 @@
     return extractId(el.getAttribute('data-iframe') || '') || null;
   }
 
+  function clampShellSize(w, h) {
+    let width = w > 0 ? w : DEFAULT_SHELL_W;
+    let height = h > 0 ? h : DEFAULT_SHELL_H;
+    // Never stretch to full page column; cap oversized readings.
+    if (width > MAX_SHELL_W || height > MAX_SHELL_H) {
+      const scale = Math.min(MAX_SHELL_W / width, MAX_SHELL_H / height, 1);
+      width = Math.round(width * scale);
+      height = Math.round(height * scale);
+    }
+    // Reject full-viewport takeover — fall back to defaults.
+    if (
+      typeof window !== 'undefined' &&
+      width >= window.innerWidth * 0.92 &&
+      height >= window.innerHeight * 0.7
+    ) {
+      width = DEFAULT_SHELL_W;
+      height = DEFAULT_SHELL_H;
+    }
+    return { width, height };
+  }
+
   /**
    * Wrap a media element in a tight shell so the overlay only covers the player,
-   * not a full-width column / page section.
+   * not a full-width column / page section. Never uses width:100% of a page wrapper.
    */
   function ensurePlayerShell(mediaEl) {
     if (!(mediaEl instanceof Element)) return null;
 
     const existing = mediaEl.closest?.('.yt-embed-player-shell');
-    if (existing) return existing;
+    if (existing) {
+      // Re-clamp if a previous version sized it to full viewport.
+      const r = existing.getBoundingClientRect();
+      if (
+        r.width >= (window.innerWidth || 0) * 0.92 &&
+        r.height >= (window.innerHeight || 0) * 0.7
+      ) {
+        const { width, height } = clampShellSize(DEFAULT_SHELL_W, DEFAULT_SHELL_H);
+        existing.style.width = `${width}px`;
+        existing.style.height = `${height}px`;
+        existing.style.maxWidth = '100%';
+      }
+      return existing;
+    }
     if (mediaEl.classList?.contains('yt-embed-player-shell')) return mediaEl;
 
     const parent = mediaEl.parentElement;
@@ -314,25 +353,22 @@
     const attrW = parseInt(mediaEl.getAttribute?.('width') || '', 10);
     const attrH = parseInt(mediaEl.getAttribute?.('height') || '', 10);
     const rect = mediaEl.getBoundingClientRect?.();
-    const w = attrW > 0 ? attrW : Math.round(rect?.width || mediaEl.offsetWidth || 0);
-    const h = attrH > 0 ? attrH : Math.round(rect?.height || mediaEl.offsetHeight || 0);
+    const rawW = attrW > 0 ? attrW : Math.round(rect?.width || mediaEl.offsetWidth || 0);
+    const rawH = attrH > 0 ? attrH : Math.round(rect?.height || mediaEl.offsetHeight || 0);
+    const { width, height } = clampShellSize(rawW, rawH);
 
-    if (w > 0 && h > 0) {
-      wrap.style.width = `${w}px`;
-      wrap.style.height = `${h}px`;
-      wrap.style.maxWidth = '100%';
-    } else {
-      wrap.style.width = '100%';
-      wrap.style.aspectRatio = '16 / 9';
-    }
+    wrap.style.width = `${width}px`;
+    wrap.style.height = `${height}px`;
+    wrap.style.maxWidth = '100%';
+    wrap.style.boxSizing = 'border-box';
 
     parent.insertBefore(wrap, mediaEl);
     wrap.appendChild(mediaEl);
 
-    // Keep iframe filling the shell when attrs were used for sizing.
-    if (mediaEl instanceof HTMLIFrameElement && w > 0 && h > 0) {
+    if (mediaEl instanceof HTMLIFrameElement) {
       mediaEl.style.width = '100%';
       mediaEl.style.height = '100%';
+      mediaEl.style.border = '0';
       mediaEl.removeAttribute('width');
       mediaEl.removeAttribute('height');
     }
@@ -344,102 +380,95 @@
   function isReasonablePlayerMount(el, mediaEl) {
     if (!(el instanceof Element)) return false;
     if (el === document.body || el === document.documentElement) return false;
-    if (el.matches?.('body, html, main, #content, #siteTable, .side, .content')) return false;
+    // Structural page chrome — never valid player boxes
+    if (
+      el.matches?.(
+        'body, html, main, #content, #siteTable, .side, .content, .expando, .entry, .thing'
+      )
+    ) {
+      return false;
+    }
+    // Our shell is always OK
+    if (el.classList.contains('yt-embed-player-shell')) return true;
 
     const er = el.getBoundingClientRect();
     if (er.width < 40 || er.height < 40) return true; // not laid out yet
 
-    // Full-viewport takeover
+    // Full-viewport takeover (both axes)
     if (
       typeof window !== 'undefined' &&
       er.width >= window.innerWidth * 0.92 &&
-      er.height >= window.innerHeight * 0.75
+      er.height >= window.innerHeight * 0.7
     ) {
       return false;
     }
 
+    // Mount much larger than the media it wraps
     if (mediaEl instanceof Element) {
       const mr = mediaEl.getBoundingClientRect();
       if (mr.width > 40 && mr.height > 40) {
-        if (er.width > mr.width * 1.75 || er.height > mr.height * 1.75) return false;
+        if (er.width > mr.width * 1.6 || er.height > mr.height * 1.6) return false;
       }
     }
     return true;
   }
 
   /**
-   * Pick the tightest sensible mount for a player media element.
-   * Prefer a shell around the media over large CMS wrappers.
-   */
-  function resolveMountForMedia(mediaEl, candidates = []) {
-    if (mediaEl instanceof HTMLIFrameElement || mediaEl?.tagName === 'VIDEO') {
-      return ensurePlayerShell(mediaEl);
-    }
-
-    for (const c of candidates) {
-      if (c && isValidMount(c) && isReasonablePlayerMount(c, mediaEl)) return c;
-    }
-
-    if (mediaEl instanceof Element && isValidMount(mediaEl) && isReasonablePlayerMount(mediaEl)) {
-      return mediaEl;
-    }
-
-    // Last resort: shell around media or its parent
-    if (mediaEl instanceof Element) return ensurePlayerShell(mediaEl);
-    return null;
-  }
-
-  /**
-   * Wire a lazy facade (thumbnail / config, iframe created later or never).
-   * Click starts the blocked timer even if no iframe appears.
+   * Wire a player-sized mount. Click/pointer on it starts the blocked timer.
+   * Never auto-shows the overlay without a user gesture.
    */
   function attachFacadeMount(mount, videoId) {
-    if (!isValidMount(mount) || !isVideoId(videoId)) return;
+    if (!isValidMount(mount) || !isVideoId(videoId)) return null;
 
-    // Prefer existing player iframe inside the facade (tight shell).
+    // Prefer existing player iframe inside the facade (tight shell only).
     const innerIframe =
       findYoutubeIframe(mount) ||
+      (mount.matches?.(REDDITMEDIA_IFRAME_SELECTOR)
+        ? mount
+        : null) ||
       mount.querySelector?.(REDDITMEDIA_IFRAME_SELECTOR) ||
-      mount.querySelector?.('iframe.media-embed, iframe');
+      mount.querySelector?.('iframe.media-embed');
+
     let target = mount;
     if (innerIframe instanceof HTMLIFrameElement) {
       const shell = ensurePlayerShell(innerIframe);
       if (shell) target = shell;
     } else if (!isReasonablePlayerMount(mount)) {
-      // Oversized wrapper (e.g. full-width .expando): shell around thumbnail if any
-      const thumb = mount.querySelector?.(
-        'img[src*="ytimg"], img[src*="youtube"], picture, .thumbnail'
-      );
-      if (thumb) {
-        const shell = ensurePlayerShell(thumb.closest('picture') || thumb);
-        if (shell) target = shell;
-      }
+      // Do not mount on oversized wrappers (full-width .expando etc.)
+      return null;
     }
 
-    if (!isValidMount(target)) return;
+    if (!isValidMount(target) || !isReasonablePlayerMount(target, innerIframe || null)) {
+      // Still too big — force a default-sized shell around media if possible
+      if (innerIframe instanceof HTMLIFrameElement) {
+        target = ensurePlayerShell(innerIframe);
+      } else {
+        return null;
+      }
+    }
+    if (!isValidMount(target)) return null;
 
     const state = getOrCreateState(target, videoId);
-    if (!state) return;
+    if (!state) return null;
 
     if (!target.hasAttribute(CLICK_MARKER)) {
       target.setAttribute(CLICK_MARKER, '1');
-      target.addEventListener(
-        'click',
-        () => {
-          primeBlockedCheck(target, videoId);
-          waitForIframe(target);
-          // Some CMS inject the iframe on a nearby wrapper, not the facade node.
-          const wrap =
-            target.closest('.cmp-embed, .cmp-embed__youtube, .embed, .expando') ||
-            target.parentElement;
-          if (wrap && wrap !== target) waitForIframe(wrap);
-        },
-        true
-      );
+      const onUserTry = () => {
+        primeBlockedCheck(target, videoId);
+        waitForIframe(target);
+        const wrap =
+          target.closest('.cmp-embed, .cmp-embed__youtube, .embed, .expando') ||
+          target.parentElement;
+        if (wrap && wrap !== target) waitForIframe(wrap);
+      };
+      // Only prime on intentional interaction with the player box
+      target.addEventListener('pointerdown', onUserTry, true);
+      target.addEventListener('click', onUserTry, true);
     }
 
-    const iframe = findYoutubeIframe(target) || findYoutubeIframe(mount);
+    const iframe = findYoutubeIframe(target);
     if (iframe) linkIframe(state, iframe);
+    return target;
   }
 
   /** Adobe AEM / generic: data-iframe JSON with type youtube + src. */
@@ -671,6 +700,7 @@
    * Fallback “is it blocked?” signal: local timer after user interaction.
    * Prefer API play/error messages when they work; if they never arrive (or are
    * stripped by privacy tooling), this still surfaces the escape hatch.
+   * MUST NOT run without userActivated (never auto on page load).
    */
   function scheduleBlockedCheck(state) {
     if (state.playing || state.blockedShown || state.dismissed || state.timer) return;
@@ -685,6 +715,9 @@
   }
 
   function primeBlockedCheck(mount, videoId) {
+    if (!isValidMount(mount) || !isVideoId(videoId)) return;
+    // Never arm the timer on a full-page mount.
+    if (!isReasonablePlayerMount(mount)) return;
     const state = getOrCreateState(mount, videoId);
     if (!state || state.dismissed) return;
     state.userActivated = true;
@@ -737,9 +770,13 @@
     return state;
   }
 
-  /** Generic mounts: interaction means the user tried to use the embed. */
+  /**
+   * Generic mounts: interaction on the mount means the user tried the embed.
+   * Do not attach to huge containers (would arm the overlay for any page click).
+   */
   function ensureMountClickHandler(mount, videoId) {
     if (!mount || mount.hasAttribute(ACTIVATE_MARKER)) return;
+    if (!isReasonablePlayerMount(mount)) return;
     mount.setAttribute(ACTIVATE_MARKER, '1');
     mount.addEventListener(
       'pointerdown',
@@ -1124,7 +1161,8 @@
   /**
    * old.reddit: post links to youtu.be but the player is a sandboxed
    * redditmedia.com iframe (opaque — no YouTube iframe in the parent page).
-   * Use data-url for the video id and mount on .expando.
+   * Use data-url for the video id; mount only on a player-sized shell.
+   * Never auto-show overlay — wait for click on the player.
    */
   function attachOldRedditYoutubeThing(thing) {
     if (!(thing instanceof Element)) return;
@@ -1136,44 +1174,27 @@
     const videoId = extractId(url);
     if (!videoId) return;
 
-    const expando = thing.querySelector('.expando');
     const btn = thing.querySelector('.expando-button');
-
-    // Not expanded yet: when user opens it, re-scan / prime.
+    // Expanding is not the same as "tried to play" — only re-wire after expand.
     if (btn && !btn.hasAttribute(CLICK_MARKER)) {
       btn.setAttribute(CLICK_MARKER, '1');
       btn.addEventListener(
         'click',
         () => {
-          const mount = thing.querySelector('.expando');
-          if (mount) {
-            attachFacadeMount(mount, videoId);
-            primeBlockedCheck(mount, videoId);
-          } else {
-            setTimeout(() => attachOldRedditYoutubeThing(thing), 100);
-          }
+          setTimeout(() => attachOldRedditYoutubeThing(thing), 100);
         },
         true
       );
     }
 
     const mediaEmbed = thing.querySelector(REDDITMEDIA_IFRAME_SELECTOR);
-    // Mount on a shell around the media iframe (player-sized), not the full-width .expando.
-    let mount = null;
-    if (mediaEmbed) {
-      mount = ensurePlayerShell(mediaEmbed);
-    } else if (expando && isValidMount(expando)) {
-      // Collapsed / not yet injected: temporary mount on expando until iframe appears.
-      mount = expando;
-    }
-    if (!mount || !isValidMount(mount)) return;
+    if (!mediaEmbed) return; // wait until the player iframe exists
 
-    attachFacadeMount(mount, videoId);
-
-    // Comment pages auto-expand: redditmedia iframe is opaque cross-origin.
-    if (mediaEmbed && isVisibleBox(mount)) {
-      primeBlockedCheck(mount, videoId);
-    }
+    // Player-sized shell only — never the full-width .expando
+    const shell = ensurePlayerShell(mediaEmbed);
+    if (!shell) return;
+    attachFacadeMount(shell, videoId);
+    // Intentionally NO primeBlockedCheck here — user must click the player.
   }
 
   function attachRedditMediaIframe(iframe) {
@@ -1192,12 +1213,9 @@
     if (!videoId) return;
 
     const shell = ensurePlayerShell(iframe);
-    if (!shell) {
-      attachOldRedditYoutubeThing(thing);
-      return;
-    }
+    if (!shell) return;
     attachFacadeMount(shell, videoId);
-    if (isVisibleBox(shell)) primeBlockedCheck(shell, videoId);
+    // No auto-prime — wait for user gesture on the shell.
   }
 
   function safeCall(fn, arg) {

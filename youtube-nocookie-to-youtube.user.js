@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.4.0
+// @version      5.4.1
 // @description  On any site: when a YouTube embed won’t play, show Watch on YouTube. Prefers player API signals; falls back to a local timer if those are blocked.
 // @author       ollebro
 // @license      MIT
@@ -86,6 +86,19 @@
     'iframe.media-embed[src*="redditmedia.com/mediaembed"], iframe[src*="redditmedia.com/mediaembed"]';
 
   const STYLE_CSS = `
+    /* Tight box around the actual player — never the full page/column */
+    .yt-embed-player-shell {
+      position: relative !important;
+      display: inline-block;
+      max-width: 100%;
+      vertical-align: top;
+      line-height: 0;
+      box-sizing: border-box;
+    }
+    .yt-embed-player-shell > iframe {
+      display: block;
+      max-width: 100%;
+    }
     .yt-embed-mount {
       position: relative;
     }
@@ -99,8 +112,9 @@
       background: #0f0f0f;
       pointer-events: auto;
       text-align: center;
-      padding: 16px;
+      padding: 12px;
       box-sizing: border-box;
+      overflow: auto;
     }
     .${OVERLAY_CLASS}.is-visible {
       display: flex !important;
@@ -109,10 +123,6 @@
       opacity: 0 !important;
       visibility: hidden !important;
       pointer-events: none !important;
-    }
-    /* old.reddit expando: keep a usable box for the overlay */
-    .expando.yt-embed-mount {
-      min-height: 200px;
     }
     .${OVERLAY_CLASS} .yt-embed-center-card {
       max-width: 340px;
@@ -285,32 +295,151 @@
   }
 
   /**
+   * Wrap a media element in a tight shell so the overlay only covers the player,
+   * not a full-width column / page section.
+   */
+  function ensurePlayerShell(mediaEl) {
+    if (!(mediaEl instanceof Element)) return null;
+
+    const existing = mediaEl.closest?.('.yt-embed-player-shell');
+    if (existing) return existing;
+    if (mediaEl.classList?.contains('yt-embed-player-shell')) return mediaEl;
+
+    const parent = mediaEl.parentElement;
+    if (!parent) return null;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'yt-embed-player-shell';
+
+    const attrW = parseInt(mediaEl.getAttribute?.('width') || '', 10);
+    const attrH = parseInt(mediaEl.getAttribute?.('height') || '', 10);
+    const rect = mediaEl.getBoundingClientRect?.();
+    const w = attrW > 0 ? attrW : Math.round(rect?.width || mediaEl.offsetWidth || 0);
+    const h = attrH > 0 ? attrH : Math.round(rect?.height || mediaEl.offsetHeight || 0);
+
+    if (w > 0 && h > 0) {
+      wrap.style.width = `${w}px`;
+      wrap.style.height = `${h}px`;
+      wrap.style.maxWidth = '100%';
+    } else {
+      wrap.style.width = '100%';
+      wrap.style.aspectRatio = '16 / 9';
+    }
+
+    parent.insertBefore(wrap, mediaEl);
+    wrap.appendChild(mediaEl);
+
+    // Keep iframe filling the shell when attrs were used for sizing.
+    if (mediaEl instanceof HTMLIFrameElement && w > 0 && h > 0) {
+      mediaEl.style.width = '100%';
+      mediaEl.style.height = '100%';
+      mediaEl.removeAttribute('width');
+      mediaEl.removeAttribute('height');
+    }
+
+    return wrap;
+  }
+
+  /** Reject mounts that are basically the whole viewport / content column. */
+  function isReasonablePlayerMount(el, mediaEl) {
+    if (!(el instanceof Element)) return false;
+    if (el === document.body || el === document.documentElement) return false;
+    if (el.matches?.('body, html, main, #content, #siteTable, .side, .content')) return false;
+
+    const er = el.getBoundingClientRect();
+    if (er.width < 40 || er.height < 40) return true; // not laid out yet
+
+    // Full-viewport takeover
+    if (
+      typeof window !== 'undefined' &&
+      er.width >= window.innerWidth * 0.92 &&
+      er.height >= window.innerHeight * 0.75
+    ) {
+      return false;
+    }
+
+    if (mediaEl instanceof Element) {
+      const mr = mediaEl.getBoundingClientRect();
+      if (mr.width > 40 && mr.height > 40) {
+        if (er.width > mr.width * 1.75 || er.height > mr.height * 1.75) return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Pick the tightest sensible mount for a player media element.
+   * Prefer a shell around the media over large CMS wrappers.
+   */
+  function resolveMountForMedia(mediaEl, candidates = []) {
+    if (mediaEl instanceof HTMLIFrameElement || mediaEl?.tagName === 'VIDEO') {
+      return ensurePlayerShell(mediaEl);
+    }
+
+    for (const c of candidates) {
+      if (c && isValidMount(c) && isReasonablePlayerMount(c, mediaEl)) return c;
+    }
+
+    if (mediaEl instanceof Element && isValidMount(mediaEl) && isReasonablePlayerMount(mediaEl)) {
+      return mediaEl;
+    }
+
+    // Last resort: shell around media or its parent
+    if (mediaEl instanceof Element) return ensurePlayerShell(mediaEl);
+    return null;
+  }
+
+  /**
    * Wire a lazy facade (thumbnail / config, iframe created later or never).
    * Click starts the blocked timer even if no iframe appears.
    */
   function attachFacadeMount(mount, videoId) {
     if (!isValidMount(mount) || !isVideoId(videoId)) return;
 
-    const state = getOrCreateState(mount, videoId);
+    // Prefer existing player iframe inside the facade (tight shell).
+    const innerIframe =
+      findYoutubeIframe(mount) ||
+      mount.querySelector?.(REDDITMEDIA_IFRAME_SELECTOR) ||
+      mount.querySelector?.('iframe.media-embed, iframe');
+    let target = mount;
+    if (innerIframe instanceof HTMLIFrameElement) {
+      const shell = ensurePlayerShell(innerIframe);
+      if (shell) target = shell;
+    } else if (!isReasonablePlayerMount(mount)) {
+      // Oversized wrapper (e.g. full-width .expando): shell around thumbnail if any
+      const thumb = mount.querySelector?.(
+        'img[src*="ytimg"], img[src*="youtube"], picture, .thumbnail'
+      );
+      if (thumb) {
+        const shell = ensurePlayerShell(thumb.closest('picture') || thumb);
+        if (shell) target = shell;
+      }
+    }
+
+    if (!isValidMount(target)) return;
+
+    const state = getOrCreateState(target, videoId);
     if (!state) return;
 
-    if (!mount.hasAttribute(CLICK_MARKER)) {
-      mount.setAttribute(CLICK_MARKER, '1');
-      mount.addEventListener(
+    if (!target.hasAttribute(CLICK_MARKER)) {
+      target.setAttribute(CLICK_MARKER, '1');
+      target.addEventListener(
         'click',
         () => {
-          primeBlockedCheck(mount, videoId);
-          waitForIframe(mount);
-          // Some CMS inject the iframe on the wrapper, not the facade node.
-          const wrap = mount.closest('.cmp-embed, .embed, [class*="embed"]') || mount.parentElement;
-          if (wrap && wrap !== mount) waitForIframe(wrap);
+          primeBlockedCheck(target, videoId);
+          waitForIframe(target);
+          // Some CMS inject the iframe on a nearby wrapper, not the facade node.
+          const wrap =
+            target.closest('.cmp-embed, .cmp-embed__youtube, .embed, .expando') ||
+            target.parentElement;
+          if (wrap && wrap !== target) waitForIframe(wrap);
         },
         true
       );
     }
 
-    const iframe = findYoutubeIframe(mount) || findYoutubeIframe(mount.parentElement);
-    if (iframe) attachIframe(iframe);
+    const iframe = findYoutubeIframe(target) || findYoutubeIframe(mount);
+    if (iframe) linkIframe(state, iframe);
   }
 
   /** Adobe AEM / generic: data-iframe JSON with type youtube + src. */
@@ -346,32 +475,40 @@
     const videoId = extractId(ref);
     if (!videoId) return;
 
-    const mount =
-      node.closest(DATA_IFRAME_SELECTOR) ||
-      node.closest(
-        [
-          '.cmp-embed__youtube',
-          '.cmp-embed',
-          '.wp-block-embed-youtube',
-          '.youtube-player',
-          '[class*="youtube"]',
-          '[class*="Youtube"]',
-        ].join(', ')
-      ) ||
-      node.closest('picture')?.parentElement ||
-      null;
+    const candidates = [
+      node.closest(DATA_IFRAME_SELECTOR),
+      node.closest('.cmp-embed__youtube'),
+      node.closest('.cmp-embed'),
+      node.closest('.wp-block-embed-youtube, .youtube-player, .yt-container'),
+      node.closest('picture')?.parentElement,
+    ].filter(Boolean);
+
+    // Prefer the smallest reasonable candidate (player box, not page chrome).
+    let mount = null;
+    for (const c of candidates) {
+      if (isValidMount(c) && isReasonablePlayerMount(c, node)) {
+        mount = c;
+        break;
+      }
+    }
+    if (!mount) {
+      // Tight shell around the poster itself.
+      mount = ensurePlayerShell(node.closest('picture') || node);
+    }
 
     if (!mount || !isValidMount(mount)) return;
     // Avoid wiring random ytimg icons/avatars without embed context.
     if (
       !mount.hasAttribute('data-iframe') &&
-      !/embed|youtube|player|video/i.test(mount.className || '') &&
-      !mount.closest('.cmp-embed, .embed, [class*="youtube"]')
+      !mount.classList.contains('yt-embed-player-shell') &&
+      !/embed|youtube|player|video|thumbnail/i.test(mount.className || '') &&
+      !mount.closest('.cmp-embed, .embed, .cmp-embed__youtube, .expando, .media-preview')
     ) {
       return;
     }
 
-    attachFacadeMount(mount, videoIdFromElementConfig(mount) || videoId);
+    const cfgHost = node.closest(DATA_IFRAME_SELECTOR) || mount;
+    attachFacadeMount(mount, videoIdFromElementConfig(cfgHost) || videoId);
   }
 
   function iframeSrc(iframe) {
@@ -675,19 +812,23 @@
   }
 
   function getMountPoint(iframe) {
+    // Always prefer a tight shell around the iframe so the overlay matches the player.
+    const shell = ensurePlayerShell(iframe);
+    if (shell) return shell;
+
     const root = iframe.getRootNode();
     if (root instanceof ShadowRoot) {
       return iframe.closest('lite-youtube') || iframe.parentElement;
     }
 
-    return (
-      iframe.closest('lite-youtube') ||
-      iframe.closest('[data-iframe]') ||
-      iframe.closest('.cmp-embed__youtube') ||
-      iframe.closest('.cmp-embed') ||
-      iframe.closest('f-embed-youtube') ||
-      iframe.closest('f-embed[data-type="youtube"]') ||
-      iframe.closest('[data-type="youtube"]') ||
+    const candidates = [
+      iframe.closest('lite-youtube'),
+      iframe.closest('.yt-embed-player-shell'),
+      iframe.closest('[data-iframe]'),
+      iframe.closest('.cmp-embed__youtube'),
+      iframe.closest('f-embed-youtube'),
+      iframe.closest('f-embed[data-type="youtube"]'),
+      iframe.closest('[data-type="youtube"]'),
       iframe.closest(
         [
           '.wp-block-embed-youtube',
@@ -699,9 +840,14 @@
           '.yt-container',
           'figure.wp-block-embed',
         ].join(', ')
-      ) ||
-      iframe.parentElement
-    );
+      ),
+      iframe.parentElement,
+    ];
+
+    for (const c of candidates) {
+      if (c && isValidMount(c) && isReasonablePlayerMount(c, iframe)) return c;
+    }
+    return iframe.parentElement;
   }
 
   function findYoutubeIframe(root) {
@@ -1011,15 +1157,22 @@
       );
     }
 
-    if (!expando || !isValidMount(expando)) return;
-
-    attachFacadeMount(expando, videoId);
-
-    // Comment pages auto-expand: media is already a redditmedia iframe.
-    // Cross-origin — never gets YT API events. Start fallback when visible.
     const mediaEmbed = thing.querySelector(REDDITMEDIA_IFRAME_SELECTOR);
-    if (mediaEmbed && isVisibleBox(expando)) {
-      primeBlockedCheck(expando, videoId);
+    // Mount on a shell around the media iframe (player-sized), not the full-width .expando.
+    let mount = null;
+    if (mediaEmbed) {
+      mount = ensurePlayerShell(mediaEmbed);
+    } else if (expando && isValidMount(expando)) {
+      // Collapsed / not yet injected: temporary mount on expando until iframe appears.
+      mount = expando;
+    }
+    if (!mount || !isValidMount(mount)) return;
+
+    attachFacadeMount(mount, videoId);
+
+    // Comment pages auto-expand: redditmedia iframe is opaque cross-origin.
+    if (mediaEmbed && isVisibleBox(mount)) {
+      primeBlockedCheck(mount, videoId);
     }
   }
 
@@ -1030,7 +1183,21 @@
       return;
     }
     const thing = iframe.closest('.thing');
-    if (thing) attachOldRedditYoutubeThing(thing);
+    if (!thing) return;
+
+    const url = thing.getAttribute('data-url') || '';
+    const domain = (thing.getAttribute('data-domain') || '').toLowerCase();
+    if (!isYoutubePageUrl(url) && !/^(youtu\.be|youtube\.com)$/i.test(domain)) return;
+    const videoId = extractId(url);
+    if (!videoId) return;
+
+    const shell = ensurePlayerShell(iframe);
+    if (!shell) {
+      attachOldRedditYoutubeThing(thing);
+      return;
+    }
+    attachFacadeMount(shell, videoId);
+    if (isVisibleBox(shell)) primeBlockedCheck(shell, videoId);
   }
 
   function safeCall(fn, arg) {

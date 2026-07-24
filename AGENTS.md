@@ -22,6 +22,7 @@ Public product is a single userscript. Keep the GitHub tree minimal.
 1. **Any site** — not a shortlist of domains.
 2. **Prefer IFrame API** when messages work; **timer fallback** after user interaction if not.
 3. **Lazy facades** (`data-iframe` JSON, ytimg posters, lite-youtube) must prime on click even when no iframe exists yet.
+3b. **old.reddit** posts use a cross-origin `redditmedia.com` iframe — use `div.thing[data-url]` for the video id and mount on `.expando`.
 4. **Escape hatch** — first-party `youtube.com/watch?v=…`. Do not spoof embed verification.
 5. **No overlay on passive load.**
 6. **`@grant none`**. Bump `@version` on user-facing changes.

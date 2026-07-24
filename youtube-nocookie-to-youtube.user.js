@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.3.0
+// @version      5.4.0
 // @description  On any site: when a YouTube embed won’t play, show Watch on YouTube. Prefers player API signals; falls back to a local timer if those are blocked.
 // @author       ollebro
 // @license      MIT
@@ -28,7 +28,7 @@
 
   // Works on any page (global @match). Universal paths:
   //   live iframes, lite-youtube, lazy CMS facades (data-iframe JSON, ytimg thumbs),
-  //   open-shadow hosts. Site-specific class names are helpers only.
+  //   open-shadow hosts, wrapper embeds (e.g. old.reddit redditmedia → youtu.be data-url).
   //
   // Detection layers (best then fallback):
   // 1) IFrame API via enablejsapi + postMessage (play / onError) when available
@@ -80,6 +80,10 @@
   /** Cheap known open-shadow hosts; full scans also discover other custom elements. */
   const SHADOW_HOST_SELECTOR = 'shreddit-embed';
   const LITE_SELECTOR = 'lite-youtube';
+  /** old.reddit link posts (YouTube URL on data-url; player is redditmedia iframe). */
+  const OLD_REDDIT_THING_SELECTOR = 'div.thing[data-url], div.thing.link';
+  const REDDITMEDIA_IFRAME_SELECTOR =
+    'iframe.media-embed[src*="redditmedia.com/mediaembed"], iframe[src*="redditmedia.com/mediaembed"]';
 
   const STYLE_CSS = `
     .yt-embed-mount {
@@ -105,6 +109,10 @@
       opacity: 0 !important;
       visibility: hidden !important;
       pointer-events: none !important;
+    }
+    /* old.reddit expando: keep a usable box for the overlay */
+    .expando.yt-embed-mount {
+      min-height: 200px;
     }
     .${OVERLAY_CLASS} .yt-embed-center-card {
       max-width: 340px;
@@ -954,6 +962,77 @@
     if (iframe) attachIframe(iframe);
   }
 
+  function isYoutubePageUrl(url) {
+    if (!url) return false;
+    return /(?:youtube\.com|youtu\.be)\b/i.test(url);
+  }
+
+  function isVisibleBox(el) {
+    if (!(el instanceof Element)) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  /**
+   * old.reddit: post links to youtu.be but the player is a sandboxed
+   * redditmedia.com iframe (opaque — no YouTube iframe in the parent page).
+   * Use data-url for the video id and mount on .expando.
+   */
+  function attachOldRedditYoutubeThing(thing) {
+    if (!(thing instanceof Element)) return;
+
+    const url = thing.getAttribute('data-url') || '';
+    const domain = (thing.getAttribute('data-domain') || '').toLowerCase();
+    if (!isYoutubePageUrl(url) && !/^(youtu\.be|youtube\.com)$/i.test(domain)) return;
+
+    const videoId = extractId(url);
+    if (!videoId) return;
+
+    const expando = thing.querySelector('.expando');
+    const btn = thing.querySelector('.expando-button');
+
+    // Not expanded yet: when user opens it, re-scan / prime.
+    if (btn && !btn.hasAttribute(CLICK_MARKER)) {
+      btn.setAttribute(CLICK_MARKER, '1');
+      btn.addEventListener(
+        'click',
+        () => {
+          const mount = thing.querySelector('.expando');
+          if (mount) {
+            attachFacadeMount(mount, videoId);
+            primeBlockedCheck(mount, videoId);
+          } else {
+            setTimeout(() => attachOldRedditYoutubeThing(thing), 100);
+          }
+        },
+        true
+      );
+    }
+
+    if (!expando || !isValidMount(expando)) return;
+
+    attachFacadeMount(expando, videoId);
+
+    // Comment pages auto-expand: media is already a redditmedia iframe.
+    // Cross-origin — never gets YT API events. Start fallback when visible.
+    const mediaEmbed = thing.querySelector(REDDITMEDIA_IFRAME_SELECTOR);
+    if (mediaEmbed && isVisibleBox(expando)) {
+      primeBlockedCheck(expando, videoId);
+    }
+  }
+
+  function attachRedditMediaIframe(iframe) {
+    if (!(iframe instanceof HTMLIFrameElement)) return;
+    const src = iframeSrc(iframe);
+    if (!/redditmedia\.com\/mediaembed/i.test(src) && !iframe.classList.contains('media-embed')) {
+      return;
+    }
+    const thing = iframe.closest('.thing');
+    if (thing) attachOldRedditYoutubeThing(thing);
+  }
+
   function safeCall(fn, arg) {
     try {
       fn(arg);
@@ -977,11 +1056,18 @@
     root.querySelectorAll('iframe[src*="youtube"], iframe[data-src*="youtube"]').forEach((el) =>
       safeCall(attachIframe, el)
     );
+    // old.reddit media wrapper (not youtube.com — opaque redditmedia embed).
+    root.querySelectorAll(REDDITMEDIA_IFRAME_SELECTOR).forEach((el) =>
+      safeCall(attachRedditMediaIframe, el)
+    );
     root.querySelectorAll(LITE_SELECTOR).forEach((el) => safeCall(attachLiteElement, el));
     root.querySelectorAll(LAZY_EMBED_SELECTOR).forEach((el) => safeCall(attachLazyEmbed, el));
     // Lazy facades: config JSON / CMS thumbs before an iframe exists (AEM, etc.).
     root.querySelectorAll(DATA_IFRAME_SELECTOR).forEach((el) => safeCall(attachDataIframeEmbed, el));
     root.querySelectorAll(YTIMG_SELECTOR).forEach((el) => safeCall(attachYtimgFacade, el));
+    root.querySelectorAll(OLD_REDDIT_THING_SELECTOR).forEach((el) =>
+      safeCall(attachOldRedditYoutubeThing, el)
+    );
     root.querySelectorAll(SHADOW_HOST_SELECTOR).forEach((el) => safeCall(watchShadowHost, el));
 
     // Open shadow is invisible to normal querySelectorAll from outside.
@@ -1097,6 +1183,7 @@
         for (const node of mutation.addedNodes) {
           if (node instanceof HTMLIFrameElement) {
             attachIframe(node);
+            attachRedditMediaIframe(node);
           } else if (node instanceof Element) {
             roots.add(node);
           } else if (node instanceof DocumentFragment) {

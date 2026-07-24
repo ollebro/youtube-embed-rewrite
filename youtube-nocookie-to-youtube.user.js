@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.5.0
+// @version      5.5.1
 // @description  On any site: when a YouTube embed won’t play after you try it, show Watch on YouTube on the player only.
 // @author       ollebro
 // @license      MIT
@@ -24,6 +24,7 @@
   const SHADOW_OBS_MARKER = 'data-yt-watch-shadow-obs';
   const SHADOW_WATCH_MARKER = 'data-yt-watch-shadow-watch';
   const OVERLAY_CLASS = 'yt-embed-center-overlay';
+  const HIT_CLASS = 'yt-embed-hit';
   const STYLE_ID = 'yt-embed-overlay-style';
 
   // Works on any page (global @match). Universal paths:
@@ -102,15 +103,34 @@
     }
     .yt-embed-player-shell > iframe {
       display: block;
+      width: 100%;
+      height: 100%;
       max-width: 100%;
+      border: 0;
     }
     .yt-embed-mount {
       position: relative;
     }
+    /*
+     * Cross-origin iframes swallow clicks (parent never sees them).
+     * Transparent catcher on top of the player arms the blocked timer on first try,
+     * then disables itself so further clicks reach the iframe.
+     */
+    .${HIT_CLASS} {
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+      background: transparent;
+      cursor: pointer;
+      pointer-events: auto;
+    }
+    .${HIT_CLASS}.is-armed {
+      pointer-events: none;
+    }
     .${OVERLAY_CLASS} {
       position: absolute;
       inset: 0;
-      z-index: 2147483647;
+      z-index: 5;
       display: none;
       align-items: center;
       justify-content: center;
@@ -127,6 +147,9 @@
     .yt-embed-mount.is-blocked iframe {
       opacity: 0 !important;
       visibility: hidden !important;
+      pointer-events: none !important;
+    }
+    .yt-embed-mount.is-blocked .${HIT_CLASS} {
       pointer-events: none !important;
     }
     .${OVERLAY_CLASS} .yt-embed-center-card {
@@ -450,21 +473,7 @@
 
     const state = getOrCreateState(target, videoId);
     if (!state) return null;
-
-    if (!target.hasAttribute(CLICK_MARKER)) {
-      target.setAttribute(CLICK_MARKER, '1');
-      const onUserTry = () => {
-        primeBlockedCheck(target, videoId);
-        waitForIframe(target);
-        const wrap =
-          target.closest('.cmp-embed, .cmp-embed__youtube, .embed, .expando') ||
-          target.parentElement;
-        if (wrap && wrap !== target) waitForIframe(wrap);
-      };
-      // Only prime on intentional interaction with the player box
-      target.addEventListener('pointerdown', onUserTry, true);
-      target.addEventListener('click', onUserTry, true);
-    }
+    // getOrCreateState installs the hit-layer catcher (needed for cross-origin iframes)
 
     const iframe = findYoutubeIframe(target);
     if (iframe) linkIframe(state, iframe);
@@ -669,6 +678,10 @@
     state.overlay.classList.add('is-visible');
     state.mount.appendChild(state.overlay);
     setIframeHidden(state.iframe, true);
+    // Also hide any nested media iframes (redditmedia, etc.)
+    state.mount.querySelectorAll('iframe').forEach((f) => setIframeHidden(f, true));
+    const hit = state.mount.querySelector(`:scope > .${HIT_CLASS}`);
+    if (hit) hit.classList.add('is-armed');
 
     const link = state.overlay.querySelector('.yt-embed-center-link');
     try {
@@ -716,12 +729,49 @@
 
   function primeBlockedCheck(mount, videoId) {
     if (!isValidMount(mount) || !isVideoId(videoId)) return;
-    // Never arm the timer on a full-page mount.
-    if (!isReasonablePlayerMount(mount)) return;
+    // Shells are always OK; reject only huge non-shell mounts.
+    if (
+      !mount.classList.contains('yt-embed-player-shell') &&
+      !isReasonablePlayerMount(mount)
+    ) {
+      return;
+    }
     const state = getOrCreateState(mount, videoId);
     if (!state || state.dismissed) return;
     state.userActivated = true;
     scheduleBlockedCheck(state);
+  }
+
+  /**
+   * Clicks on cross-origin iframes never bubble to the parent page.
+   * A transparent hit layer captures the first interaction, arms the timer,
+   * then lets further clicks through to the iframe.
+   */
+  function ensureInteractionCatcher(mount, videoId) {
+    if (!isValidMount(mount) || !isVideoId(videoId)) return;
+    if (mount.querySelector(`:scope > .${HIT_CLASS}`)) return;
+
+    ensureRelative(mount);
+    const hit = document.createElement('div');
+    hit.className = HIT_CLASS;
+    hit.setAttribute('aria-hidden', 'true');
+    hit.title = 'Click to play';
+
+    const arm = () => {
+      if (hit.classList.contains('is-armed')) return;
+      hit.classList.add('is-armed');
+      primeBlockedCheck(mount, videoId);
+      // Re-scan for late iframe injection after the user tried to play
+      waitForIframe(mount);
+      const wrap =
+        mount.closest('.cmp-embed, .cmp-embed__youtube, .embed, .expando') ||
+        mount.parentElement;
+      if (wrap && wrap !== mount) waitForIframe(wrap);
+    };
+
+    hit.addEventListener('pointerdown', arm, true);
+    hit.addEventListener('click', arm, true);
+    mount.appendChild(hit);
   }
 
   function isValidMount(mount) {
@@ -766,25 +816,8 @@
     };
     mountStates.set(mount, state);
     mount.setAttribute(MARKER, videoId);
-    ensureMountClickHandler(mount, videoId);
+    ensureInteractionCatcher(mount, videoId);
     return state;
-  }
-
-  /**
-   * Generic mounts: interaction on the mount means the user tried the embed.
-   * Do not attach to huge containers (would arm the overlay for any page click).
-   */
-  function ensureMountClickHandler(mount, videoId) {
-    if (!mount || mount.hasAttribute(ACTIVATE_MARKER)) return;
-    if (!isReasonablePlayerMount(mount)) return;
-    mount.setAttribute(ACTIVATE_MARKER, '1');
-    mount.addEventListener(
-      'pointerdown',
-      () => {
-        primeBlockedCheck(mount, videoId || mount.getAttribute(MARKER));
-      },
-      true
-    );
   }
 
   function registerIframeId(state, iframe) {

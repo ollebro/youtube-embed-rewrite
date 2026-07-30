@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.5.3
+// @version      5.5.4
 // @description  On any site: when a YouTube embed won’t play after you try it, show Watch on YouTube on the player only.
 // @author       ollebro
 // @license      MIT
@@ -117,8 +117,8 @@
     }
     /*
      * Cross-origin iframes swallow clicks (parent never sees them).
-     * Transparent catcher on top of the player arms the blocked timer on first try,
-     * then disables itself so further clicks reach the iframe.
+     * Catcher is OFF until the player is visibly on-screen (lightboxes etc.),
+     * arms the timer on first try, then disables so further clicks reach the iframe.
      */
     .${HIT_CLASS} {
       position: absolute;
@@ -126,9 +126,12 @@
       z-index: 2;
       background: transparent;
       cursor: pointer;
+      pointer-events: none;
+    }
+    .${HIT_CLASS}.is-listening:not(.is-spent) {
       pointer-events: auto;
     }
-    .${HIT_CLASS}.is-armed {
+    .${HIT_CLASS}.is-spent {
       pointer-events: none;
     }
     .${OVERLAY_CLASS} {
@@ -368,41 +371,85 @@
     return { width, height };
   }
 
+  function isYoutubeIframeEl(el) {
+    return (
+      el instanceof HTMLIFrameElement && /youtube(-nocookie)?\.com/i.test(iframeSrc(el))
+    );
+  }
+
+  function isRedditMediaIframeEl(el) {
+    if (!(el instanceof HTMLIFrameElement)) return false;
+    const src = iframeSrc(el);
+    return /redditmedia\.com\/mediaembed/i.test(src) || el.classList.contains('media-embed');
+  }
+
   /**
-   * Wrap a media element in a tight shell so the overlay only covers the player,
-   * not a full-width column / page section. Never uses width:100% of a page wrapper.
+   * Player-sized mount for the overlay.
+   * - YouTube iframes: fill the existing host (lightbox/modal/content) — never freeze
+   *   collapsed/hidden layout sizes (that broke DeepMind-style lightbox players).
+   * - redditmedia / unknown: fixed-size wrap using attrs or safe defaults.
    */
   function ensurePlayerShell(mediaEl) {
     if (!(mediaEl instanceof Element)) return null;
 
     const existing = mediaEl.closest?.('.yt-embed-player-shell');
-    if (existing) {
-      // Re-clamp if a previous version sized it to full viewport.
-      const r = existing.getBoundingClientRect();
-      if (
-        r.width >= (window.innerWidth || 0) * 0.92 &&
-        r.height >= (window.innerHeight || 0) * 0.7
-      ) {
-        const { width, height } = clampShellSize(DEFAULT_SHELL_W, DEFAULT_SHELL_H);
-        existing.style.width = `${width}px`;
-        existing.style.height = `${height}px`;
-        existing.style.maxWidth = '100%';
-      }
-      return existing;
-    }
+    if (existing) return existing;
     if (mediaEl.classList?.contains('yt-embed-player-shell')) return mediaEl;
 
     const parent = mediaEl.parentElement;
     if (!parent) return null;
 
+    // --- YouTube: adopt the site's player host (fills lightbox when opened) ---
+    if (isYoutubeIframeEl(mediaEl)) {
+      const host =
+        mediaEl.closest(
+          [
+            '.lightbox__content',
+            '.lightbox__body',
+            '.media-embed__content',
+            '.media-embed',
+            '[class*="lightbox"]',
+            '[class*="Lightbox"]',
+            '[class*="modal__"]',
+            '[class*="Modal"]',
+            '.video-wrapper',
+            'lite-youtube',
+          ].join(', ')
+        ) || parent;
+
+      if (
+        host &&
+        host !== document.body &&
+        host !== document.documentElement &&
+        !host.matches?.('body, html, main, #content')
+      ) {
+        ensureRelative(host);
+        host.classList.add('yt-embed-player-shell');
+        host.setAttribute('data-yt-shell-mode', 'fill');
+        // Let the host define size; iframe fills it
+        mediaEl.style.width = '100%';
+        mediaEl.style.height = '100%';
+        mediaEl.style.border = '0';
+        mediaEl.style.display = 'block';
+        return host;
+      }
+    }
+
+    // --- Fixed wrap (redditmedia / fallback) ---
     const wrap = document.createElement('div');
     wrap.className = 'yt-embed-player-shell';
+    wrap.setAttribute('data-yt-shell-mode', 'fixed');
 
     const attrW = parseInt(mediaEl.getAttribute?.('width') || '', 10);
     const attrH = parseInt(mediaEl.getAttribute?.('height') || '', 10);
     const rect = mediaEl.getBoundingClientRect?.();
-    const rawW = attrW > 0 ? attrW : Math.round(rect?.width || mediaEl.offsetWidth || 0);
-    const rawH = attrH > 0 ? attrH : Math.round(rect?.height || mediaEl.offsetHeight || 0);
+    // Ignore collapsed/hidden measurements (0 or tiny)
+    let rawW = attrW > 0 ? attrW : Math.round(rect?.width || 0);
+    let rawH = attrH > 0 ? attrH : Math.round(rect?.height || 0);
+    if (rawW < 80 || rawH < 45) {
+      rawW = DEFAULT_SHELL_W;
+      rawH = DEFAULT_SHELL_H;
+    }
     const { width, height } = clampShellSize(rawW, rawH);
 
     wrap.style.width = `${width}px`;
@@ -706,7 +753,10 @@
     // Also hide any nested media iframes (redditmedia, etc.)
     state.mount.querySelectorAll('iframe').forEach((f) => setIframeHidden(f, true));
     const hit = state.mount.querySelector(`:scope > .${HIT_CLASS}`);
-    if (hit) hit.classList.add('is-armed');
+    if (hit) {
+      hit.classList.add('is-spent');
+      hit.classList.remove('is-listening');
+    }
 
     const link = state.overlay.querySelector('.yt-embed-center-link');
     try {
@@ -769,8 +819,8 @@
 
   /**
    * Clicks on cross-origin iframes never bubble to the parent page.
-   * A transparent hit layer captures the first interaction, arms the timer,
-   * then lets further clicks through to the iframe.
+   * Hit layer only listens when the player is actually visible (so hidden
+   * lightbox embeds don't steal clicks or freeze a tiny player box).
    */
   function ensureInteractionCatcher(mount, videoId) {
     if (!isValidMount(mount) || !isVideoId(videoId)) return;
@@ -780,23 +830,44 @@
     const hit = document.createElement('div');
     hit.className = HIT_CLASS;
     hit.setAttribute('aria-hidden', 'true');
-    hit.title = 'Click to play';
 
     const arm = () => {
-      if (hit.classList.contains('is-armed')) return;
-      hit.classList.add('is-armed');
+      if (hit.classList.contains('is-spent')) return;
+      if (!hit.classList.contains('is-listening')) return;
+      hit.classList.add('is-spent');
       primeBlockedCheck(mount, videoId);
-      // Re-scan for late iframe injection after the user tried to play
       waitForIframe(mount);
       const wrap =
-        mount.closest('.cmp-embed, .cmp-embed__youtube, .embed, .expando') ||
-        mount.parentElement;
+        mount.closest(
+          '.cmp-embed, .cmp-embed__youtube, .embed, .expando, .lightbox, [class*="lightbox"]'
+        ) || mount.parentElement;
       if (wrap && wrap !== mount) waitForIframe(wrap);
     };
 
     hit.addEventListener('pointerdown', arm, true);
     hit.addEventListener('click', arm, true);
     mount.appendChild(hit);
+
+    if (typeof IntersectionObserver === 'function') {
+      const io = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            const r = entry.boundingClientRect;
+            const bigEnough = r.width >= 120 && r.height >= 70;
+            if (entry.isIntersecting && entry.intersectionRatio >= 0.15 && bigEnough) {
+              hit.classList.add('is-listening');
+            } else if (!hit.classList.contains('is-spent')) {
+              hit.classList.remove('is-listening');
+            }
+          }
+        },
+        { threshold: [0, 0.15, 0.4, 0.7] }
+      );
+      io.observe(mount);
+    } else {
+      const r = mount.getBoundingClientRect();
+      if (r.width >= 120 && r.height >= 70) hit.classList.add('is-listening');
+    }
   }
 
   function isValidMount(mount) {

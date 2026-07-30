@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.5.1
+// @version      5.5.2
 // @description  On any site: when a YouTube embed won’t play after you try it, show Watch on YouTube on the player only.
 // @author       ollebro
 // @license      MIT
@@ -151,6 +151,11 @@
     }
     .yt-embed-mount.is-blocked .${HIT_CLASS} {
       pointer-events: none !important;
+    }
+    /* old.reddit: post has no embed — compact in-page watch card */
+    .yt-embed-reddit-fallback {
+      margin: 8px 0 6px;
+      max-width: 100%;
     }
     .${OVERLAY_CLASS} .yt-embed-center-card {
       max-width: 340px;
@@ -1192,10 +1197,9 @@
   }
 
   /**
-   * old.reddit: post links to youtu.be but the player is a sandboxed
-   * redditmedia.com iframe (opaque — no YouTube iframe in the parent page).
-   * Use data-url for the video id; mount only on a player-sized shell.
-   * Never auto-show overlay — wait for click on the player.
+   * old.reddit YouTube link posts (data-url → youtu.be):
+   * A) Media embed iframe present → shell + hit layer; overlay after click+timeout
+   * B) No embed at all (common) → compact in-page Watch card under the title
    */
   function attachOldRedditYoutubeThing(thing) {
     if (!(thing instanceof Element)) return;
@@ -1208,26 +1212,60 @@
     if (!videoId) return;
 
     const btn = thing.querySelector('.expando-button');
-    // Expanding is not the same as "tried to play" — only re-wire after expand.
     if (btn && !btn.hasAttribute(CLICK_MARKER)) {
       btn.setAttribute(CLICK_MARKER, '1');
       btn.addEventListener(
         'click',
         () => {
-          setTimeout(() => attachOldRedditYoutubeThing(thing), 100);
+          setTimeout(() => attachOldRedditYoutubeThing(thing), 150);
         },
         true
       );
     }
 
     const mediaEmbed = thing.querySelector(REDDITMEDIA_IFRAME_SELECTOR);
-    if (!mediaEmbed) return; // wait until the player iframe exists
+    if (mediaEmbed) {
+      // Remove no-embed fallback if Reddit later injects a real player
+      thing.querySelector('.yt-embed-reddit-fallback')?.remove();
+      const shell = ensurePlayerShell(mediaEmbed);
+      if (!shell) return;
+      attachFacadeMount(shell, videoId);
+      return;
+    }
 
-    // Player-sized shell only — never the full-width .expando
-    const shell = ensurePlayerShell(mediaEmbed);
-    if (!shell) return;
-    attachFacadeMount(shell, videoId);
-    // Intentionally NO primeBlockedCheck here — user must click the player.
+    // No redditmedia player on this post — still offer Watch on YouTube in-page.
+    ensureOldRedditNoEmbedCard(thing, videoId);
+  }
+
+  /**
+   * When old.reddit does not render an embed (no .expando / media iframe),
+   * insert a player-sized card with the Watch on YouTube overlay.
+   */
+  function ensureOldRedditNoEmbedCard(thing, videoId) {
+    if (thing.querySelector('.yt-embed-reddit-fallback')) return;
+    // If an expando exists but iframe not yet loaded, wait for media instead of duplicating UI
+    if (thing.querySelector('.expando-button, .expando')) return;
+
+    const entry = thing.querySelector(':scope > .entry') || thing.querySelector('.entry');
+    if (!entry) return;
+
+    const card = document.createElement('div');
+    card.className =
+      'yt-embed-reddit-fallback yt-embed-player-shell yt-embed-mount';
+    const { width, height } = clampShellSize(366, 210);
+    card.style.width = `${width}px`;
+    card.style.height = `${height}px`;
+    card.style.maxWidth = '100%';
+
+    const topMatter = entry.querySelector(':scope > .top-matter');
+    if (topMatter) topMatter.insertAdjacentElement('afterend', card);
+    else entry.insertBefore(card, entry.firstChild);
+
+    const state = getOrCreateState(card, videoId);
+    if (!state) return;
+    // Nothing to "try" — show the escape hatch immediately on this compact card only.
+    state.userActivated = true;
+    showBlocked(state);
   }
 
   function attachRedditMediaIframe(iframe) {

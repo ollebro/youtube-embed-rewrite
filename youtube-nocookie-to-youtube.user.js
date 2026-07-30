@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.5.2
+// @version      5.5.3
 // @description  On any site: when a YouTube embed won’t play after you try it, show Watch on YouTube on the player only.
 // @author       ollebro
 // @license      MIT
@@ -42,6 +42,8 @@
   const DEFAULT_SHELL_H = 360;
   const MAX_SHELL_W = 960;
   const MAX_SHELL_H = 540;
+  /** Wait for late redditmedia injection before offering a no-embed fallback. */
+  const NO_EMBED_FALLBACK_MS = 2500;
   const MIN_PLAYBACK_SECONDS = 0.3;
   const WAIT_IFRAME_MS = 15000;
   const SCAN_DEBOUNCE_MS = 80;
@@ -52,6 +54,8 @@
   const mountStates = new WeakMap();
   /** iframe id -> state (works across open shadow roots; getElementById does not) */
   const stateByIframeId = new Map();
+  /** old.reddit thing element -> pending no-embed fallback timer */
+  const noEmbedTimers = new WeakMap();
 
   let idSeq = 0;
   let scanTimer = null;
@@ -152,10 +156,26 @@
     .yt-embed-mount.is-blocked .${HIT_CLASS} {
       pointer-events: none !important;
     }
-    /* old.reddit: post has no embed — compact in-page watch card */
+    /* old.reddit: no embed available — small CTA, not a blocking overlay */
     .yt-embed-reddit-fallback {
       margin: 8px 0 6px;
       max-width: 100%;
+    }
+    .yt-embed-reddit-fallback .yt-embed-reddit-cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      border-radius: 8px;
+      background: #ff0000;
+      color: #fff !important;
+      font: 700 14px/1.2 system-ui, -apple-system, Segoe UI, sans-serif;
+      text-decoration: none !important;
+      box-shadow: 0 2px 8px rgba(0,0,0,.25);
+    }
+    .yt-embed-reddit-fallback .yt-embed-reddit-cta:hover {
+      background: #cc0000;
+      color: #fff !important;
     }
     .${OVERLAY_CLASS} .yt-embed-center-card {
       max-width: 340px;
@@ -1198,8 +1218,8 @@
 
   /**
    * old.reddit YouTube link posts (data-url → youtu.be):
-   * A) Media embed iframe present → shell + hit layer; overlay after click+timeout
-   * B) No embed at all (common) → compact in-page Watch card under the title
+   * A) Media embed iframe present → shell + hit layer; overlay only after click+timeout
+   * B) No embed ever → small non-blocking Watch link (never auto dark-overlay)
    */
   function attachOldRedditYoutubeThing(thing) {
     if (!(thing instanceof Element)) return;
@@ -1217,6 +1237,8 @@
       btn.addEventListener(
         'click',
         () => {
+          // User is expanding media — cancel any pending no-embed CTA
+          clearNoEmbedTimer(thing);
           setTimeout(() => attachOldRedditYoutubeThing(thing), 150);
         },
         true
@@ -1225,7 +1247,8 @@
 
     const mediaEmbed = thing.querySelector(REDDITMEDIA_IFRAME_SELECTOR);
     if (mediaEmbed) {
-      // Remove no-embed fallback if Reddit later injects a real player
+      clearNoEmbedTimer(thing);
+      // Remove no-embed fallback if Reddit injected a real player
       thing.querySelector('.yt-embed-reddit-fallback')?.remove();
       const shell = ensurePlayerShell(mediaEmbed);
       if (!shell) return;
@@ -1233,39 +1256,64 @@
       return;
     }
 
-    // No redditmedia player on this post — still offer Watch on YouTube in-page.
-    ensureOldRedditNoEmbedCard(thing, videoId);
+    // Expando controls present → user can still open the player; don't steal play.
+    if (thing.querySelector('.expando-button, .expando')) {
+      clearNoEmbedTimer(thing);
+      return;
+    }
+
+    // No player yet — wait before offering a small fallback link (late embeds).
+    scheduleOldRedditNoEmbedFallback(thing, videoId);
+  }
+
+  function clearNoEmbedTimer(thing) {
+    const t = noEmbedTimers.get(thing);
+    if (t != null) {
+      clearTimeout(t);
+      noEmbedTimers.delete(thing);
+    }
+  }
+
+  function scheduleOldRedditNoEmbedFallback(thing, videoId) {
+    if (thing.querySelector('.yt-embed-reddit-fallback')) return;
+    if (noEmbedTimers.has(thing)) return;
+
+    const timer = setTimeout(() => {
+      noEmbedTimers.delete(thing);
+      if (!thing.isConnected) return;
+      // Media or expand control appeared in the meantime
+      if (thing.querySelector(REDDITMEDIA_IFRAME_SELECTOR)) {
+        attachOldRedditYoutubeThing(thing);
+        return;
+      }
+      if (thing.querySelector('.expando-button, .expando')) return;
+      insertOldRedditWatchLink(thing, videoId);
+    }, NO_EMBED_FALLBACK_MS);
+
+    noEmbedTimers.set(thing, timer);
   }
 
   /**
-   * When old.reddit does not render an embed (no .expando / media iframe),
-   * insert a player-sized card with the Watch on YouTube overlay.
+   * Compact non-blocking CTA under the title — not a full dark overlay.
+   * Only used when Reddit never provides an in-page player.
    */
-  function ensureOldRedditNoEmbedCard(thing, videoId) {
+  function insertOldRedditWatchLink(thing, videoId) {
     if (thing.querySelector('.yt-embed-reddit-fallback')) return;
-    // If an expando exists but iframe not yet loaded, wait for media instead of duplicating UI
-    if (thing.querySelector('.expando-button, .expando')) return;
+    if (thing.querySelector(REDDITMEDIA_IFRAME_SELECTOR)) return;
 
     const entry = thing.querySelector(':scope > .entry') || thing.querySelector('.entry');
     if (!entry) return;
 
-    const card = document.createElement('div');
-    card.className =
-      'yt-embed-reddit-fallback yt-embed-player-shell yt-embed-mount';
-    const { width, height } = clampShellSize(366, 210);
-    card.style.width = `${width}px`;
-    card.style.height = `${height}px`;
-    card.style.maxWidth = '100%';
+    const bar = document.createElement('div');
+    bar.className = 'yt-embed-reddit-fallback';
+    bar.innerHTML =
+      `<a class="yt-embed-reddit-cta" href="${watchUrl(videoId)}" target="_blank" rel="noopener noreferrer">` +
+      YT_ICON +
+      '<span>Watch on YouTube</span></a>';
 
     const topMatter = entry.querySelector(':scope > .top-matter');
-    if (topMatter) topMatter.insertAdjacentElement('afterend', card);
-    else entry.insertBefore(card, entry.firstChild);
-
-    const state = getOrCreateState(card, videoId);
-    if (!state) return;
-    // Nothing to "try" — show the escape hatch immediately on this compact card only.
-    state.userActivated = true;
-    showBlocked(state);
+    if (topMatter) topMatter.insertAdjacentElement('afterend', bar);
+    else entry.appendChild(bar);
   }
 
   function attachRedditMediaIframe(iframe) {

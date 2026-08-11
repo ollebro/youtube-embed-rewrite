@@ -1388,9 +1388,13 @@
   }
 
   function handleYoutubeMessage(event) {
-    if (
-      !/https?:\/\/([a-z0-9-]+\.)?(youtube\.com|youtube-nocookie\.com)/i.test(event.origin)
-    ) {
+    let originHost;
+    try {
+      originHost = new URL(event.origin).hostname;
+    } catch {
+      return;
+    }
+    if (!isYoutubeHost(originHost)) {
       return;
     }
 

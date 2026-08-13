@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.6.0
+// @version      5.6.1
 // @description  On any site: when a YouTube embed won’t play after you try it, show Watch on YouTube on the player only.
 // @author       ollebro
 // @license      MIT
@@ -22,7 +22,9 @@
   const ENHANCED_MARKER = 'data-yt-watch-enhanced';
   const SHADOW_OBS_MARKER = 'data-yt-watch-shadow-obs';
   const SHADOW_WATCH_MARKER = 'data-yt-watch-shadow-watch';
+  const HIDDEN_MARKER = 'data-yt-watch-hidden';
   const SHELL_MODE = 'data-yt-shell-mode';
+  const FILL_PLAYER_CLASS = 'yt-embed-fill-player';
   const OVERLAY_CLASS = 'yt-embed-center-overlay';
   const HIT_CLASS = 'yt-embed-hit';
   const STYLE_ID = 'yt-embed-overlay-style';
@@ -42,6 +44,10 @@
   const SCAN_DEBOUNCE_MS = 80;
   const HIT_MIN_W = 120;
   const HIT_MIN_H = 70;
+  const HIT_MIN_RATIO = 0.15;
+  const MIN_FILL_HOST_H = 45;
+  const FILL_HOST_SLACK = 8;
+  const STATE_PRUNE_THRESHOLD = 64;
 
   /** @type {WeakMap<HTMLIFrameElement, object>} */
   const states = new WeakMap();
@@ -119,7 +125,12 @@
       position: relative !important;
       box-sizing: border-box;
     }
-    .yt-embed-player-shell > iframe {
+    /* Only stretch the iframe inside shells we sized ourselves. A "fill" host
+       that keeps the site's own layout must not get height: 100% — against an
+       auto-height parent that percentage resolves somewhere unrelated (it
+       walks up to the nearest definite height) and mis-sizes the player. */
+    .yt-embed-player-shell[data-yt-shell-mode="fixed"] > iframe,
+    .yt-embed-player-shell.${FILL_PLAYER_CLASS} > iframe {
       display: block;
       width: 100%;
       height: 100%;
@@ -277,8 +288,51 @@
     return typeof id === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(id);
   }
 
+  /**
+   * First usable video id among several attributes. Checks every candidate
+   * rather than short-circuiting on the first non-empty one, since a CMS may
+   * put its own opaque key in `data-id` and the real id in `data-youtube-id`.
+   */
+  function firstVideoId(...values) {
+    for (const value of values) {
+      if (isVideoId(value)) return value;
+      if (typeof value !== 'string' || !value) continue;
+      const extracted = extractId(value);
+      if (isVideoId(extracted)) return extracted;
+    }
+    return null;
+  }
+
+  /**
+   * Where an iframe's real embed URL lives. Lazy embeds park a placeholder in
+   * `src` and keep the YouTube URL in `data-src`, so reporting `src` blindly
+   * makes the element fail every youtube check while still matching
+   * YOUTUBE_IFRAME_SELECTOR. Returns the attribute too, so callers rewrite the
+   * one that actually holds the URL instead of navigating the placeholder.
+   * @returns {{attr: 'src'|'data-src', value: string}|null}
+   */
+  function iframeSrcRef(iframe) {
+    if (!iframe) return null;
+    const attrSrc = iframe.getAttribute?.('src');
+    if (attrSrc && !isPlaceholderSrc(attrSrc)) {
+      return { attr: 'src', value: iframe.src || attrSrc };
+    }
+    if (iframe.src && !isPlaceholderSrc(iframe.src)) {
+      return { attr: 'src', value: iframe.src };
+    }
+    const dataSrc = iframe.getAttribute?.('data-src');
+    if (dataSrc && !isPlaceholderSrc(dataSrc)) {
+      return { attr: 'data-src', value: dataSrc };
+    }
+    return null;
+  }
+
+  function isPlaceholderSrc(value) {
+    return /^\s*(?:about:blank|about:srcdoc|javascript:|data:text\/html)/i.test(value || '');
+  }
+
   function iframeSrc(iframe) {
-    return iframe?.src || iframe?.getAttribute?.('src') || iframe?.getAttribute?.('data-src') || '';
+    return iframeSrcRef(iframe)?.value || '';
   }
 
   function isYoutubeHost(hostname) {
@@ -307,6 +361,35 @@
     if (!(mount instanceof Element)) return false;
     const tag = mount.tagName;
     return tag !== 'STYLE' && tag !== 'LINK' && tag !== 'SCRIPT';
+  }
+
+  /**
+   * True when `host` has room the media does not already account for — i.e. a
+   * real sized container to fill, not a wrapper whose height the media defines.
+   */
+  function hostOutsizesMedia(host, mediaEl) {
+    try {
+      const hostH = host.getBoundingClientRect().height;
+      if (hostH < MIN_FILL_HOST_H) return false;
+      const mediaH = mediaEl.getBoundingClientRect().height;
+      // Media not laid out yet (lazy iframe, or a lightbox built before open):
+      // the sized host is the only thing to go on.
+      if (mediaH < 1) return true;
+      return hostH > mediaH + FILL_HOST_SLACK;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Fraction of `rect`'s area inside the viewport, 0 when it has no area. */
+  function visibleFraction(rect) {
+    const vw = window.innerWidth || 0;
+    const vh = window.innerHeight || 0;
+    const area = (rect.width || 0) * (rect.height || 0);
+    if (!area || !vw || !vh) return 0;
+    const w = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+    const h = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+    return (w * h) / area;
   }
 
   function ensureRelative(el) {
@@ -508,10 +591,15 @@
   function setIframeHidden(iframe, hidden) {
     if (!(iframe instanceof HTMLIFrameElement)) return;
     if (hidden) {
+      iframe.setAttribute(HIDDEN_MARKER, '1');
       iframe.style.setProperty('opacity', '0', 'important');
       iframe.style.setProperty('visibility', 'hidden', 'important');
       iframe.style.setProperty('pointer-events', 'none', 'important');
     } else {
+      // Unwind only what we set — the page may have hidden this iframe itself,
+      // and dismissing must not reveal a player the site meant to keep hidden.
+      if (!iframe.hasAttribute(HIDDEN_MARKER)) return;
+      iframe.removeAttribute(HIDDEN_MARKER);
       iframe.style.removeProperty('opacity');
       iframe.style.removeProperty('visibility');
       iframe.style.removeProperty('pointer-events');
@@ -622,10 +710,18 @@
         ensureRelative(host);
         host.classList.add('yt-embed-player-shell');
         host.setAttribute(SHELL_MODE, 'fill');
-        mediaEl.style.width = '100%';
-        mediaEl.style.height = '100%';
-        mediaEl.style.border = '0';
-        mediaEl.style.display = 'block';
+        // Stretch the player only into a host that is genuinely taller than it
+        // (an opened lightbox/modal). On auto-height wrappers — figure.wp-block-embed
+        // and friends — the host's height comes *from* the iframe, so a
+        // percentage height is circular and resolves against some far ancestor
+        // instead, mis-sizing the player. There, leave the site's sizing alone.
+        if (hostOutsizesMedia(host, mediaEl)) {
+          host.classList.add(FILL_PLAYER_CLASS);
+          mediaEl.style.width = '100%';
+          mediaEl.style.height = '100%';
+          mediaEl.style.border = '0';
+          mediaEl.style.display = 'block';
+        }
         return host;
       }
     }
@@ -696,24 +792,22 @@
     hit.addEventListener('click', arm, true);
     mount.appendChild(hit);
 
-    const syncListening = (rect, isIntersecting) => {
+    const syncListening = (rect, ratio) => {
       if (hit.classList.contains('is-spent')) return;
       const bigEnough = rect.width >= HIT_MIN_W && rect.height >= HIT_MIN_H;
-      // Treat as visible if intersecting OR already has a solid on-screen box
-      // (some browsers report intersectionRatio 0 for oversized/off-ratio boxes).
+      // Require a real slice of the player on screen before arming, so the
+      // layer never swallows a click meant for a barely-visible player. Some
+      // browsers report intersectionRatio 0 for oversized/off-ratio boxes, so
+      // measure the viewport overlap ourselves as a second opinion.
       const onScreen =
-        isIntersecting ||
-        (rect.bottom > 0 &&
-          rect.right > 0 &&
-          rect.top < (window.innerHeight || 0) &&
-          rect.left < (window.innerWidth || 0));
+        ratio >= HIT_MIN_RATIO || visibleFraction(rect) >= HIT_MIN_RATIO;
       if (onScreen && bigEnough) hit.classList.add('is-listening');
       else hit.classList.remove('is-listening');
     };
 
     // Immediate check — don't wait for IO callback (fixes headless + already-visible players)
     try {
-      syncListening(mount.getBoundingClientRect(), true);
+      syncListening(mount.getBoundingClientRect(), 0);
     } catch {
       /* ignore */
     }
@@ -724,7 +818,10 @@
       const io = new IntersectionObserver(
         (entries) => {
           for (const entry of entries) {
-            syncListening(entry.boundingClientRect, entry.isIntersecting);
+            syncListening(
+              entry.boundingClientRect,
+              entry.isIntersecting ? entry.intersectionRatio : 0
+            );
           }
         },
         { threshold: [0, 0.05, 0.15, 0.4, 0.7] }
@@ -787,6 +884,22 @@
     stateByIframeId.set(state.iframeId, state);
   }
 
+  /**
+   * `stateByIframeId` is the one strong map here (message routing needs a
+   * lookup that pierces open shadow roots), so detached mounts would otherwise
+   * pile up for the tab's lifetime on infinite-scroll feeds.
+   */
+  function pruneDetachedStates() {
+    if (stateByIframeId.size < STATE_PRUNE_THRESHOLD) return;
+    for (const [id, state] of stateByIframeId) {
+      const anchor = state.iframe || state.mount;
+      if (!anchor || anchor.isConnected !== false) continue;
+      clearTimer(state);
+      hitObservers.get(state.mount)?.disconnect();
+      stateByIframeId.delete(id);
+    }
+  }
+
   function enhanceEmbedSrc(rawSrc) {
     if (!rawSrc) return null;
     try {
@@ -815,7 +928,8 @@
     if (!(iframe instanceof HTMLIFrameElement)) return;
     if (iframe.hasAttribute(ENHANCED_MARKER)) return;
 
-    const raw = iframeSrc(iframe);
+    const ref = iframeSrcRef(iframe);
+    const raw = ref?.value || '';
     if (!raw || !/youtube(-nocookie)?\.com/i.test(raw)) return;
 
     const next = enhanceEmbedSrc(raw);
@@ -823,11 +937,10 @@
     iframe.setAttribute(ENHANCED_MARKER, '1');
     if (!next || next === raw) return;
 
-    if (iframe.getAttribute('src') || iframe.src) {
-      iframe.src = next;
-    } else if (iframe.getAttribute('data-src')) {
-      iframe.setAttribute('data-src', next);
-    }
+    // Write back to whichever attribute held the URL. Assigning `src` on a
+    // lazy facade would load the player before the user asked for it.
+    if (ref.attr === 'src') iframe.src = next;
+    else iframe.setAttribute('data-src', next);
   }
 
   function linkIframe(state, iframe) {
@@ -853,7 +966,10 @@
     if (!iframe.hasAttribute(LOAD_MARKER)) {
       iframe.setAttribute(LOAD_MARKER, '1');
       iframe.addEventListener('load', () => {
-        if (state.userActivated) scheduleBlockedCheck(state);
+        // Resolve the state at event time: this listener is bound once, but the
+        // iframe may have been relinked to a different state since.
+        const current = states.get(iframe);
+        if (current?.userActivated) scheduleBlockedCheck(current);
       });
     }
 
@@ -888,22 +1004,33 @@
     return root?.querySelector?.(YOUTUBE_IFRAME_SELECTOR) || null;
   }
 
+  /**
+   * Attach whichever kind of player `container` holds. The selectors are
+   * substring matches, so they can also hit a decoy (a non-YouTube URL that
+   * merely mentions youtube.com); returns false for those so callers keep
+   * waiting for the real one instead of settling on it.
+   */
+  function attachAnyIframe(container) {
+    const iframe =
+      findYoutubeIframe(container) || container?.querySelector?.(REDDITMEDIA_IFRAME_SELECTOR);
+    if (!(iframe instanceof HTMLIFrameElement)) return false;
+    if (isYoutubeIframeEl(iframe)) {
+      attachIframe(iframe);
+      return true;
+    }
+    if (isRedditMediaIframeEl(iframe)) {
+      attachRedditMediaIframe(iframe);
+      return true;
+    }
+    return false;
+  }
+
   function waitForIframe(container) {
     if (!container) return;
-    const existing = findYoutubeIframe(container) || container.querySelector?.(REDDITMEDIA_IFRAME_SELECTOR);
-    if (existing instanceof HTMLIFrameElement) {
-      if (isYoutubeIframeEl(existing)) attachIframe(existing);
-      else if (isRedditMediaIframeEl(existing)) attachRedditMediaIframe(existing);
-      return;
-    }
+    if (attachAnyIframe(container)) return;
 
     const observer = new MutationObserver(() => {
-      const iframe =
-        findYoutubeIframe(container) || container.querySelector?.(REDDITMEDIA_IFRAME_SELECTOR);
-      if (!(iframe instanceof HTMLIFrameElement)) return;
-      observer.disconnect();
-      if (isYoutubeIframeEl(iframe)) attachIframe(iframe);
-      else if (isRedditMediaIframeEl(iframe)) attachRedditMediaIframe(iframe);
+      if (attachAnyIframe(container)) observer.disconnect();
     });
     observer.observe(container, {
       childList: true,
@@ -1033,12 +1160,13 @@
   }
 
   function attachLazyEmbed(el) {
-    const videoId =
-      el.dataset?.id ||
-      el.getAttribute('data-youtube-id') ||
-      el.getAttribute('data-video-id') ||
-      el.dataset?.youtubeId;
-    if (!isVideoId(videoId)) return;
+    const videoId = firstVideoId(
+      el.dataset?.id,
+      el.getAttribute('data-youtube-id'),
+      el.getAttribute('data-video-id'),
+      el.dataset?.youtubeId
+    );
+    if (!videoId) return;
 
     const type = (el.dataset?.type || el.getAttribute('data-provider') || '').toLowerCase();
     if (type && type !== 'youtube') return;
@@ -1305,7 +1433,9 @@
 
   function discoverOpenShadowEmbeds(root) {
     if (!root?.querySelectorAll) return;
-    // Prefer custom elements (hyphenated tags) — cheaper than every node on huge pages
+    // CSS cannot select "any custom element", so this walks everything and
+    // filters on the hyphenated tag name. Kept off the hot path: full scans
+    // only, never per-root incremental ones.
     const customs = root.querySelectorAll('*');
     for (const el of customs) {
       if (!el.tagName || !el.tagName.includes('-')) continue;
@@ -1336,21 +1466,26 @@
     return root === document || root === document.documentElement || root === document.body;
   }
 
+  /**
+   * `querySelectorAll` never returns the root itself, but a mutation can add a
+   * matching element as the top-level node — so test the root too.
+   */
+  function scanEach(root, selector, fn) {
+    if (root instanceof Element && root.matches?.(selector)) safeCall(fn, root);
+    root.querySelectorAll(selector).forEach((el) => safeCall(fn, el));
+  }
+
   function scan(root = document) {
     if (!root?.querySelectorAll) return;
 
-    root.querySelectorAll(YOUTUBE_IFRAME_SELECTOR).forEach((el) => safeCall(attachIframe, el));
-    root.querySelectorAll(REDDITMEDIA_IFRAME_SELECTOR).forEach((el) =>
-      safeCall(attachRedditMediaIframe, el)
-    );
-    root.querySelectorAll(LITE_SELECTOR).forEach((el) => safeCall(attachLiteElement, el));
-    root.querySelectorAll(LAZY_EMBED_SELECTOR).forEach((el) => safeCall(attachLazyEmbed, el));
-    root.querySelectorAll(DATA_IFRAME_SELECTOR).forEach((el) => safeCall(attachDataIframeEmbed, el));
-    root.querySelectorAll(YTIMG_SELECTOR).forEach((el) => safeCall(attachYtimgFacade, el));
-    root.querySelectorAll(OLD_REDDIT_THING_SELECTOR).forEach((el) =>
-      safeCall(attachOldRedditYoutubeThing, el)
-    );
-    root.querySelectorAll(SHADOW_HOST_SELECTOR).forEach((el) => safeCall(watchShadowHost, el));
+    scanEach(root, YOUTUBE_IFRAME_SELECTOR, attachIframe);
+    scanEach(root, REDDITMEDIA_IFRAME_SELECTOR, attachRedditMediaIframe);
+    scanEach(root, LITE_SELECTOR, attachLiteElement);
+    scanEach(root, LAZY_EMBED_SELECTOR, attachLazyEmbed);
+    scanEach(root, DATA_IFRAME_SELECTOR, attachDataIframeEmbed);
+    scanEach(root, YTIMG_SELECTOR, attachYtimgFacade);
+    scanEach(root, OLD_REDDIT_THING_SELECTOR, attachOldRedditYoutubeThing);
+    scanEach(root, SHADOW_HOST_SELECTOR, watchShadowHost);
 
     if (isDocumentRoot(root)) {
       discoverOpenShadowEmbeds(document);
@@ -1377,6 +1512,7 @@
       const roots = pendingScanRoots;
       needFullScan = false;
       pendingScanRoots = null;
+      safeCall(pruneDetachedStates);
       if (full || !roots) {
         scan(document);
         return;

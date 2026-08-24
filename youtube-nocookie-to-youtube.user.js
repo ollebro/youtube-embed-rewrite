@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.6.1
+// @version      5.6.2
 // @description  On any site: when a YouTube embed won’t play after you try it, show Watch on YouTube on the player only.
 // @author       ollebro
 // @license      MIT
@@ -25,6 +25,7 @@
   const HIDDEN_MARKER = 'data-yt-watch-hidden';
   const SHELL_MODE = 'data-yt-shell-mode';
   const FILL_PLAYER_CLASS = 'yt-embed-fill-player';
+  const RELAY_TYPE = 'yt-embed-rewrite-relay';
   const OVERLAY_CLASS = 'yt-embed-center-overlay';
   const HIT_CLASS = 'yt-embed-hit';
   const STYLE_ID = 'yt-embed-overlay-style';
@@ -55,6 +56,8 @@
   const mountStates = new WeakMap();
   /** iframe id → state (shadow-safe; getElementById does not pierce open shadow) */
   const stateByIframeId = new Map();
+  /** video id → states showing it (cross-frame relay target; see relayVideoStateUp) */
+  const statesByVideoId = new Map();
   /** @type {WeakMap<Element, number>} */
   const noEmbedTimers = new WeakMap();
   /** @type {WeakMap<Element, IntersectionObserver>} */
@@ -836,13 +839,30 @@
     return `yt-embed-watch-${videoId}-${idSeq}`;
   }
 
+  function registerVideoIdState(videoId, state) {
+    if (!isVideoId(videoId)) return;
+    let set = statesByVideoId.get(videoId);
+    if (!set) {
+      set = new Set();
+      statesByVideoId.set(videoId, set);
+    }
+    set.add(state);
+  }
+
+  function unregisterVideoIdState(videoId, state) {
+    const set = statesByVideoId.get(videoId);
+    set?.delete(state);
+  }
+
   function getOrCreateState(mount, videoId) {
     if (!isValidMount(mount)) return null;
 
     let state = mountStates.get(mount);
     if (state) {
       if (videoId && state.videoId !== videoId) {
+        unregisterVideoIdState(state.videoId, state);
         state.videoId = videoId;
+        registerVideoIdState(videoId, state);
         const link = state.overlay.querySelector('.yt-embed-center-link');
         if (link) link.href = watchUrl(videoId);
       }
@@ -866,6 +886,7 @@
       iframeId: nextIframeId(videoId),
     };
     mountStates.set(mount, state);
+    registerVideoIdState(videoId, state);
     mount.setAttribute(MARKER, videoId);
     ensureInteractionCatcher(mount, videoId);
     return state;
@@ -890,13 +911,25 @@
    * pile up for the tab's lifetime on infinite-scroll feeds.
    */
   function pruneDetachedStates() {
-    if (stateByIframeId.size < STATE_PRUNE_THRESHOLD) return;
-    for (const [id, state] of stateByIframeId) {
-      const anchor = state.iframe || state.mount;
-      if (!anchor || anchor.isConnected !== false) continue;
-      clearTimer(state);
-      hitObservers.get(state.mount)?.disconnect();
-      stateByIframeId.delete(id);
+    if (stateByIframeId.size >= STATE_PRUNE_THRESHOLD) {
+      for (const [id, state] of stateByIframeId) {
+        const anchor = state.iframe || state.mount;
+        if (!anchor || anchor.isConnected !== false) continue;
+        clearTimer(state);
+        hitObservers.get(state.mount)?.disconnect();
+        stateByIframeId.delete(id);
+      }
+    }
+
+    // Facade mounts with no confirmable iframe (e.g. old.reddit's redditmedia.com
+    // wrapper) never register in stateByIframeId, so they need their own sweep.
+    if (statesByVideoId.size >= STATE_PRUNE_THRESHOLD) {
+      for (const [videoId, set] of statesByVideoId) {
+        for (const state of set) {
+          if (state.mount?.isConnected === false) set.delete(state);
+        }
+        if (set.size === 0) statesByVideoId.delete(videoId);
+      }
     }
   }
 
@@ -1523,17 +1556,36 @@
     }, SCAN_DEBOUNCE_MS);
   }
 
-  function handleYoutubeMessage(event) {
-    let originHost;
-    try {
-      originHost = new URL(event.origin).hostname;
-    } catch {
-      return;
+  /** Apply a confirmed playing/blocked signal to every mount showing this video in this frame. */
+  function applyVideoStateLocally(videoId, kind) {
+    const set = statesByVideoId.get(videoId);
+    if (!set) return;
+    for (const state of set) {
+      if (kind === 'playing') hideBlocked(state);
+      else if (kind === 'blocked') {
+        state.userActivated = true;
+        showBlocked(state);
+      }
     }
-    if (!isYoutubeHost(originHost)) {
-      return;
-    }
+  }
 
+  /**
+   * Forward a confirmed signal to the parent frame. Needed because some sites
+   * (e.g. old.reddit's redditmedia.com mediaembed) wrap the YouTube iframe in
+   * an intermediate cross-origin iframe: the API postMessage only reaches its
+   * immediate parent, so the nested script instance running there relays the
+   * outcome up to the ancestor whose overlay is the one actually on screen.
+   */
+  function relayVideoStateUp(videoId, kind) {
+    if (!isVideoId(videoId) || window.parent === window) return;
+    try {
+      window.parent.postMessage({ type: RELAY_TYPE, videoId, event: kind }, '*');
+    } catch {
+      /* cross-origin postMessage should not throw, but stay defensive */
+    }
+  }
+
+  function handleYoutubeMessage(event) {
     let data = event.data;
     if (typeof data === 'string') {
       try {
@@ -1543,6 +1595,22 @@
       }
     }
     if (!data || typeof data !== 'object') return;
+
+    if (data.type === RELAY_TYPE && isVideoId(data.videoId)) {
+      applyVideoStateLocally(data.videoId, data.event);
+      relayVideoStateUp(data.videoId, data.event);
+      return;
+    }
+
+    let originHost;
+    try {
+      originHost = new URL(event.origin).hostname;
+    } catch {
+      return;
+    }
+    if (!isYoutubeHost(originHost)) {
+      return;
+    }
 
     const iframeId = data.id;
     if (!iframeId) return;
@@ -1560,6 +1628,7 @@
       // 1 = playing
       if (typeof time === 'number' && time > MIN_PLAYBACK_SECONDS && playerState === 1) {
         hideBlocked(state);
+        relayVideoStateUp(state.videoId, 'playing');
       }
       return;
     }
@@ -1567,6 +1636,7 @@
     if (data.event === 'onError') {
       state.userActivated = true;
       showBlocked(state);
+      relayVideoStateUp(state.videoId, 'blocked');
     }
   }
 

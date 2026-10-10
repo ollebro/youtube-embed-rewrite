@@ -16,7 +16,7 @@ YouTube **embeds** often fail bot/human checks — especially with privacy addon
 
 | Layer | Behavior |
 |-------|----------|
-| **IFrame API** (when available) | `enablejsapi` + play / error messages — hide overlay if playing, show sooner on hard errors |
+| **IFrame API** (when available) | `enablejsapi` + `listening` handshake + play / error messages — hide overlay if playing, show sooner on hard errors |
 | **Local timer** (fallback) | After you try to play, if playback never confirms, show the overlay |
 | **Escape** | Link to `https://www.youtube.com/watch?v=…` |
 

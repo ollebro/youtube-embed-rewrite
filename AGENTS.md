@@ -21,6 +21,8 @@ Public product is a single userscript. Keep the GitHub tree minimal.
 
 1. **Any site** — not a shortlist of domains.
 2. **Prefer IFrame API** when messages work; **timer fallback** after user interaction if not.
+2b. The player is silent until the parent posts `{"event":"listening"}` — send it ourselves (delayed, so a site's own API goes first). Route replies by `event.source`, never `data.id` (the site API uses its own internal ids). `infoDelivery` sends only changed fields.
+2c. **Never cover a live player** to catch clicks — it eats the play click. Detect clicks into the cross-origin iframe via window `blur` + `document.activeElement`.
 3. **Lazy facades** (`data-iframe` JSON, ytimg posters, lite-youtube) must prime on click even when no iframe exists yet.
 3b. **old.reddit** posts use a cross-origin `redditmedia.com` iframe — use `div.thing[data-url]` for the video id and mount on `.expando`.
 4. **Escape hatch** — first-party `youtube.com/watch?v=…`. Do not spoof embed verification.

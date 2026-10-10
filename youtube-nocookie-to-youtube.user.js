@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch on YouTube — Blocked Embeds
 // @namespace    https://greasyfork.org/users/1621606-ollebro
-// @version      5.6.2
+// @version      5.7.0
 // @description  On any site: when a YouTube embed won’t play after you try it, show Watch on YouTube on the player only.
 // @author       ollebro
 // @license      MIT
@@ -27,12 +27,13 @@
   const FILL_PLAYER_CLASS = 'yt-embed-fill-player';
   const RELAY_TYPE = 'yt-embed-rewrite-relay';
   const OVERLAY_CLASS = 'yt-embed-center-overlay';
-  const HIT_CLASS = 'yt-embed-hit';
   const STYLE_ID = 'yt-embed-overlay-style';
 
   // Detection:
-  // 1) IFrame API postMessage (play / onError) when available
-  // 2) Timer after a real user gesture on the player (hit-layer for cross-origin iframes)
+  // 1) IFrame API postMessage (play / onError), handshaking ourselves when the
+  //    site hasn't loaded YouTube's API
+  // 2) Timer after a real user gesture on the player (focus moving into the
+  //    cross-origin iframe, or a click on a facade)
   // Overlay mounts on a player-sized shell only — never page chrome.
   const BLOCKED_DELAY_MS = 2000;
   const DEFAULT_SHELL_W = 640;
@@ -43,9 +44,13 @@
   const MIN_PLAYBACK_SECONDS = 0.3;
   const WAIT_IFRAME_MS = 15000;
   const SCAN_DEBOUNCE_MS = 80;
-  const HIT_MIN_W = 120;
-  const HIT_MIN_H = 70;
-  const HIT_MIN_RATIO = 0.15;
+  // Give the site's own IFrame API first go at the handshake; polling
+  // alongside it could confuse which id the player reports to.
+  const HANDSHAKE_DELAY_MS = 1500;
+  const HANDSHAKE_INTERVAL_MS = 250;
+  const HANDSHAKE_ATTEMPTS = 40;
+  const MAX_BUFFER_DEFERRALS = 3;
+  const TAB_FOCUS_WINDOW_MS = 150;
   const MIN_FILL_HOST_H = 45;
   const FILL_HOST_SLACK = 8;
   const STATE_PRUNE_THRESHOLD = 64;
@@ -54,14 +59,12 @@
   const states = new WeakMap();
   /** @type {WeakMap<Element, object>} */
   const mountStates = new WeakMap();
-  /** iframe id → state (shadow-safe; getElementById does not pierce open shadow) */
+  /** our iframe key → linked state; the strong set message routing walks (shadow-safe) */
   const stateByIframeId = new Map();
   /** video id → states showing it (cross-frame relay target; see relayVideoStateUp) */
   const statesByVideoId = new Map();
   /** @type {WeakMap<Element, number>} */
   const noEmbedTimers = new WeakMap();
-  /** @type {WeakMap<Element, IntersectionObserver>} */
-  const hitObservers = new WeakMap();
 
   let idSeq = 0;
   let scanTimer = null;
@@ -143,20 +146,6 @@
     .yt-embed-mount {
       position: relative;
     }
-    .${HIT_CLASS} {
-      position: absolute;
-      inset: 0;
-      z-index: 2;
-      background: transparent;
-      cursor: pointer;
-      pointer-events: none;
-    }
-    .${HIT_CLASS}.is-listening:not(.is-spent) {
-      pointer-events: auto;
-    }
-    .${HIT_CLASS}.is-spent {
-      pointer-events: none;
-    }
     .${OVERLAY_CLASS} {
       position: absolute;
       inset: 0;
@@ -177,9 +166,6 @@
     .yt-embed-mount.is-blocked iframe {
       opacity: 0 !important;
       visibility: hidden !important;
-      pointer-events: none !important;
-    }
-    .yt-embed-mount.is-blocked .${HIT_CLASS} {
       pointer-events: none !important;
     }
     .yt-embed-reddit-fallback {
@@ -384,17 +370,6 @@
     }
   }
 
-  /** Fraction of `rect`'s area inside the viewport, 0 when it has no area. */
-  function visibleFraction(rect) {
-    const vw = window.innerWidth || 0;
-    const vh = window.innerHeight || 0;
-    const area = (rect.width || 0) * (rect.height || 0);
-    if (!area || !vw || !vh) return 0;
-    const w = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
-    const h = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
-    return (w * h) / area;
-  }
-
   function ensureRelative(el) {
     if (!el) return;
     try {
@@ -549,7 +524,10 @@
       into instanceof ShadowRoot
         ? into
         : into || document.head || document.documentElement;
-    if (!parent || parent.getElementById?.(STYLE_ID)) return;
+    if (!parent) return;
+    // Elements have no getElementById; look the style up on the root that holds it.
+    const root = into instanceof ShadowRoot ? into : document;
+    if (root.getElementById(STYLE_ID)) return;
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = STYLE_CSS;
@@ -629,11 +607,6 @@
     state.mount.appendChild(state.overlay);
     setIframeHidden(state.iframe, true);
     setAllIframesHidden(state.mount, true);
-    const hit = state.mount.querySelector(`:scope > .${HIT_CLASS}`);
-    if (hit) {
-      hit.classList.add('is-spent');
-      hit.classList.remove('is-listening');
-    }
     const link = state.overlay.querySelector('.yt-embed-center-link');
     try {
       link?.focus({ preventScroll: true });
@@ -669,9 +642,14 @@
     if (!state.userActivated) return;
     state.timer = setTimeout(() => {
       state.timer = null;
-      if (!state.playing && !state.blockedShown && !state.dismissed) {
-        showBlocked(state);
+      if (state.playing || state.blockedShown || state.dismissed) return;
+      // A live player still buffering (slow network, pre-roll) isn't blocked yet.
+      if (state.apiAlive && state.playerState === 3 && state.deferrals < MAX_BUFFER_DEFERRALS) {
+        state.deferrals += 1;
+        scheduleBlockedCheck(state);
+        return;
       }
+      showBlocked(state);
     }, BLOCKED_DELAY_MS);
   }
 
@@ -769,69 +747,76 @@
     return wrap;
   }
 
-  function ensureInteractionCatcher(mount, videoId) {
-    if (!isValidMount(mount) || !isVideoId(videoId)) return;
-    if (mount.querySelector(`:scope > .${HIT_CLASS}`)) return;
+  /**
+   * Prime on a click inside the mount. Only facades see these — a click into a
+   * live cross-origin iframe never reaches this document (see watchFrameFocus).
+   */
+  function ensureClickPrimer(mount) {
+    if (mount.hasAttribute(CLICK_MARKER)) return;
+    mount.setAttribute(CLICK_MARKER, '1');
+    mount.addEventListener(
+      'click',
+      (e) => {
+        if (e.target instanceof Element && e.target.closest(`.${OVERLAY_CLASS}`)) return;
+        const videoId = mountStates.get(mount)?.videoId;
+        if (!videoId) return;
+        primeBlockedCheck(mount, videoId);
+        waitForIframe(mount);
+        const wrap =
+          mount.closest(
+            '.cmp-embed, .cmp-embed__youtube, .embed, .expando, .lightbox, .lightbox__content, .media-embed'
+          ) || mount.parentElement;
+        if (wrap && wrap !== mount) waitForIframe(wrap);
+      },
+      true
+    );
+  }
 
-    ensureRelative(mount);
-    const hit = document.createElement('div');
-    hit.className = HIT_CLASS;
-    hit.setAttribute('aria-hidden', 'true');
+  function deepActiveElement() {
+    let el = document.activeElement;
+    while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+    return el;
+  }
 
-    const arm = () => {
-      if (hit.classList.contains('is-spent')) return;
-      if (!hit.classList.contains('is-listening')) return;
-      hit.classList.add('is-spent');
-      primeBlockedCheck(mount, videoId);
-      waitForIframe(mount);
-      const wrap =
-        mount.closest(
-          '.cmp-embed, .cmp-embed__youtube, .embed, .expando, .lightbox, .lightbox__content, .media-embed'
-        ) || mount.parentElement;
-      if (wrap && wrap !== mount) waitForIframe(wrap);
+  /**
+   * Clicking into a cross-origin iframe blurs this window and makes the iframe
+   * the active element — the one gesture signal we get without covering the
+   * player (a covering layer would eat the click meant for play). Focus can
+   * then hop between iframes without another blur, so poll while unfocused.
+   * Tabbing past a player also moves focus into it; that is not a play attempt.
+   */
+  function watchFrameFocus() {
+    let poll = null;
+    let lastFrame = null;
+    let lastTabAt = 0;
+
+    const check = () => {
+      const el = deepActiveElement();
+      if (!(el instanceof HTMLIFrameElement) || el === lastFrame) return;
+      lastFrame = el;
+      if (Date.now() - lastTabAt < TAB_FOCUS_WINDOW_MS) return;
+      const state = states.get(el) || mountStates.get(el.closest('.yt-embed-mount'));
+      if (!state || state.dismissed) return;
+      state.userActivated = true;
+      scheduleBlockedCheck(state);
     };
 
-    hit.addEventListener('pointerdown', arm, true);
-    hit.addEventListener('click', arm, true);
-    mount.appendChild(hit);
-
-    const syncListening = (rect, ratio) => {
-      if (hit.classList.contains('is-spent')) return;
-      const bigEnough = rect.width >= HIT_MIN_W && rect.height >= HIT_MIN_H;
-      // Require a real slice of the player on screen before arming, so the
-      // layer never swallows a click meant for a barely-visible player. Some
-      // browsers report intersectionRatio 0 for oversized/off-ratio boxes, so
-      // measure the viewport overlap ourselves as a second opinion.
-      const onScreen =
-        ratio >= HIT_MIN_RATIO || visibleFraction(rect) >= HIT_MIN_RATIO;
-      if (onScreen && bigEnough) hit.classList.add('is-listening');
-      else hit.classList.remove('is-listening');
-    };
-
-    // Immediate check — don't wait for IO callback (fixes headless + already-visible players)
-    try {
-      syncListening(mount.getBoundingClientRect(), 0);
-    } catch {
-      /* ignore */
-    }
-
-    if (typeof IntersectionObserver === 'function') {
-      const prev = hitObservers.get(mount);
-      if (prev) prev.disconnect();
-      const io = new IntersectionObserver(
-        (entries) => {
-          for (const entry of entries) {
-            syncListening(
-              entry.boundingClientRect,
-              entry.isIntersecting ? entry.intersectionRatio : 0
-            );
-          }
-        },
-        { threshold: [0, 0.05, 0.15, 0.4, 0.7] }
-      );
-      io.observe(mount);
-      hitObservers.set(mount, io);
-    }
+    window.addEventListener(
+      'keydown',
+      (e) => {
+        if (e.key === 'Tab') lastTabAt = Date.now();
+      },
+      true
+    );
+    window.addEventListener('blur', () => {
+      setTimeout(check, 0);
+      if (poll == null) poll = setInterval(check, 500);
+    });
+    window.addEventListener('focus', () => {
+      clearInterval(poll);
+      poll = null;
+      lastFrame = null;
+    });
   }
 
   function nextIframeId(videoId) {
@@ -884,25 +869,92 @@
       userActivated: false,
       timer: null,
       iframeId: nextIframeId(videoId),
+      apiAlive: false,
+      playerState: null,
+      currentTime: 0,
+      deferrals: 0,
+      handshake: null,
+      handshakeSent: false,
     };
     mountStates.set(mount, state);
     registerVideoIdState(videoId, state);
     mount.setAttribute(MARKER, videoId);
-    ensureInteractionCatcher(mount, videoId);
+    ensureClickPrimer(mount);
     return state;
   }
 
-  function registerIframeId(state, iframe) {
-    if (state.iframeId && stateByIframeId.get(state.iframeId) === state) {
-      stateByIframeId.delete(state.iframeId);
+  function stateForSource(source) {
+    if (!source) return null;
+    for (const state of stateByIframeId.values()) {
+      if (state.iframe?.contentWindow === source) return state;
     }
-    if (iframe.id) {
-      state.iframeId = iframe.id;
-    } else {
-      if (!state.iframeId) state.iframeId = nextIframeId(state.videoId);
-      iframe.id = state.iframeId;
+    return null;
+  }
+
+  function stopHandshake(state) {
+    if (state.handshake == null) return;
+    clearTimeout(state.handshake);
+    state.handshake = null;
+  }
+
+  /**
+   * The player stays silent until the parent sends {"event":"listening"} —
+   * YouTube's own widget API polls it until the player answers. Do the same
+   * for players whose page never loaded that API; stop once anything replies.
+   */
+  function startHandshake(state) {
+    stopHandshake(state);
+    const iframe = state.iframe;
+    let attempts = 0;
+    const send = () => {
+      state.handshake = null;
+      if (state.apiAlive || state.iframe !== iframe || !iframe.isConnected) return;
+      const ref = iframeSrcRef(iframe);
+      if (ref?.attr !== 'src') return;
+      let targetOrigin;
+      try {
+        targetOrigin = new URL(ref.value, location.href).origin;
+      } catch {
+        return;
+      }
+      try {
+        iframe.contentWindow?.postMessage(
+          JSON.stringify({ event: 'listening', id: state.iframeId, channel: 'widget' }),
+          targetOrigin
+        );
+      } catch {
+        /* window gone mid-navigation */
+      }
+      state.handshakeSent = true;
+      attempts += 1;
+      if (attempts < HANDSHAKE_ATTEMPTS) {
+        state.handshake = setTimeout(send, HANDSHAKE_INTERVAL_MS);
+      }
+    };
+    state.handshake = setTimeout(send, HANDSHAKE_DELAY_MS);
+  }
+
+  /**
+   * Errors only arrive for events someone subscribed to. Only called when our
+   * handshake woke the player — never send commands into the site's own API.
+   */
+  function subscribePlayerEvents(state, source, origin) {
+    for (const name of ['onError', 'onStateChange']) {
+      try {
+        source.postMessage(
+          JSON.stringify({
+            event: 'command',
+            func: 'addEventListener',
+            args: [name],
+            id: state.iframeId,
+            channel: 'widget',
+          }),
+          origin
+        );
+      } catch {
+        /* ignore */
+      }
     }
-    stateByIframeId.set(state.iframeId, state);
   }
 
   /**
@@ -916,7 +968,7 @@
         const anchor = state.iframe || state.mount;
         if (!anchor || anchor.isConnected !== false) continue;
         clearTimer(state);
-        hitObservers.get(state.mount)?.disconnect();
+        stopHandshake(state);
         stateByIframeId.delete(id);
       }
     }
@@ -991,10 +1043,13 @@
     }
 
     state.iframe = iframe;
+    state.apiAlive = false;
+    state.handshakeSent = false;
     states.set(iframe, state);
     iframe.setAttribute(MARKER, state.videoId);
-    registerIframeId(state, iframe);
+    stateByIframeId.set(state.iframeId, state);
     enhanceIframeSrc(iframe);
+    startHandshake(state);
 
     if (!iframe.hasAttribute(LOAD_MARKER)) {
       iframe.setAttribute(LOAD_MARKER, '1');
@@ -1002,7 +1057,12 @@
         // Resolve the state at event time: this listener is bound once, but the
         // iframe may have been relinked to a different state since.
         const current = states.get(iframe);
-        if (current?.userActivated) scheduleBlockedCheck(current);
+        if (!current) return;
+        // A (re)loaded player is a fresh window that has heard no handshake.
+        current.apiAlive = false;
+        current.handshakeSent = false;
+        startHandshake(current);
+        if (current.userActivated) scheduleBlockedCheck(current);
       });
     }
 
@@ -1207,18 +1267,6 @@
     const container =
       el.querySelector('f-embed-youtube') || el.querySelector(LITE_SELECTOR) || el;
 
-    if (!container.hasAttribute(CLICK_MARKER)) {
-      container.setAttribute(CLICK_MARKER, '1');
-      container.addEventListener(
-        'click',
-        () => {
-          primeBlockedCheck(container, videoId);
-          waitForIframe(container);
-        },
-        true
-      );
-    }
-
     getOrCreateState(container, videoId);
     const iframe = findYoutubeIframe(container);
     if (iframe) attachIframe(iframe);
@@ -1231,18 +1279,6 @@
       lite.getAttribute('video-id') ||
       extractId(lite.getAttribute('src') || '');
     if (!isVideoId(videoId)) return;
-
-    if (!lite.hasAttribute(CLICK_MARKER)) {
-      lite.setAttribute(CLICK_MARKER, '1');
-      lite.addEventListener(
-        'click',
-        () => {
-          primeBlockedCheck(lite, videoId);
-          waitForIframe(lite);
-        },
-        true
-      );
-    }
 
     const state = getOrCreateState(lite, videoId);
     if (!state) return;
@@ -1612,29 +1648,40 @@
       return;
     }
 
-    const iframeId = data.id;
-    if (!iframeId) return;
-
-    let state = stateByIframeId.get(iframeId);
-    if (!state) {
-      const iframe = document.getElementById(iframeId);
-      if (iframe instanceof HTMLIFrameElement) state = states.get(iframe);
-    }
+    // Route by sending window, not data.id: that id is whatever the last
+    // "listening" message carried — ours, or the site API's internal counter.
+    const state = stateForSource(event.source);
     if (!state) return;
 
-    if (data.event === 'infoDelivery' && data.info && typeof data.info === 'object') {
-      const time = data.info.currentTime;
-      const playerState = data.info.playerState;
-      // 1 = playing
-      if (typeof time === 'number' && time > MIN_PLAYBACK_SECONDS && playerState === 1) {
-        hideBlocked(state);
-        relayVideoStateUp(state.videoId, 'playing');
-      }
+    if (!state.apiAlive) {
+      state.apiAlive = true;
+      stopHandshake(state);
+      if (state.handshakeSent) subscribePlayerEvents(state, event.source, event.origin);
+    }
+
+    // infoDelivery sends only fields that changed, so accumulate them.
+    const info = data.info;
+    if (
+      (data.event === 'infoDelivery' || data.event === 'initialDelivery') &&
+      info &&
+      typeof info === 'object'
+    ) {
+      if (typeof info.currentTime === 'number') state.currentTime = info.currentTime;
+      if (typeof info.playerState === 'number') state.playerState = info.playerState;
+    } else if (data.event === 'onStateChange' && typeof info === 'number') {
+      state.playerState = info;
+    }
+
+    // 1 = playing
+    if (!state.playing && state.playerState === 1 && state.currentTime > MIN_PLAYBACK_SECONDS) {
+      hideBlocked(state);
+      relayVideoStateUp(state.videoId, 'playing');
       return;
     }
 
     if (data.event === 'onError') {
       state.userActivated = true;
+      state.playing = false;
       showBlocked(state);
       relayVideoStateUp(state.videoId, 'blocked');
     }
@@ -1643,6 +1690,7 @@
   function start() {
     injectStyles();
     window.addEventListener('message', handleYoutubeMessage, true);
+    watchFrameFocus();
 
     const runScan = () => scheduleScan(document);
     if (document.documentElement) runScan();
@@ -1688,6 +1736,7 @@
     });
 
     const observe = () => {
+      injectStyles();
       observer.observe(document.documentElement, {
         childList: true,
         subtree: true,
